@@ -6,7 +6,7 @@
  * loops, conditionals, Promise.all, and data transforms, then executes it in a
  * V8 isolate sandbox. One call in, one structured result out.
  *
- * Inspired by TanStack AI Code Mode:
+ * Inspired by TanStack AI Code Mode by Jack Herrington, Alem Tuzlak, and Tanner Linsley:
  *   https://tanstack.com/blog/tanstack-ai-code-mode
  *
  * Toggle: /code-mode  or  Ctrl+Alt+C

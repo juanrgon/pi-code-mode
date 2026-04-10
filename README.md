@@ -49,7 +49,7 @@ This executes in a V8 isolate with a 120-second timeout and 128MB memory limit.
 
 ## Credits
 
-This extension is inspired by [TanStack AI Code Mode](https://tanstack.com/blog/tanstack-ai-code-mode) by Tanner Linsley. The core idea — giving the LLM a code execution tool to compose multiple tool calls in a single round-trip — comes directly from that article.
+This extension is inspired by [TanStack AI Code Mode](https://tanstack.com/blog/tanstack-ai-code-mode) by Jack Herrington, Alem Tuzlak, and Tanner Linsley. The core idea — giving the LLM a code execution tool to compose multiple tool calls in a single round-trip — comes directly from that article.
 
 ## License
 
