@@ -1,0 +1,24 @@
+{
+  "name": "@juanrgon/pi-code-mode",
+  "version": "0.1.0",
+  "description": "Code Mode extension for pi — gives the LLM an execute_typescript tool to compose multiple tool calls in a V8 sandbox",
+  "keywords": ["pi-package", "pi-extension", "code-mode", "typescript", "sandbox"],
+  "license": "MIT",
+  "author": "juanrgon",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/juanrgon/pi-code-mode"
+  },
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "isolated-vm": "^5.0.1"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  }
+}
