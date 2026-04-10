@@ -1,7 +1,14 @@
 /**
  * V8 isolate sandbox for executing TypeScript code with external_* tool bridges.
+ *
+ * TypeScript stripping approach borrowed from @tanstack/ai-code-mode which uses
+ * esbuild's transform API for reliable TS→JS conversion.
+ *
+ * Error handling across the isolate boundary follows TanStack's pattern of
+ * serializing tool results as { success, value/error } JSON.
  */
 import ivm from "isolated-vm";
+import { transform } from "esbuild";
 
 export interface ExternalFunction {
 	name: string;
@@ -20,12 +27,51 @@ const TIMEOUT_MS = 120_000;
 const MEMORY_LIMIT_MB = 128;
 
 /**
+ * Strip TypeScript syntax from code using esbuild.
+ *
+ * The code is wrapped in an async function so top-level `return` and `await`
+ * work, then unwrapped after transformation. This approach comes from
+ * @tanstack/ai-code-mode's strip-typescript.ts.
+ */
+const WRAPPER_FN = "___PI_WRAPPER___";
+const WRAPPER_END = "___PI_WRAPPER_END___";
+
+async function stripTypeScript(code: string): Promise<string> {
+	const wrapped = `async function ${WRAPPER_FN}() {\n${code}\n}; ${WRAPPER_END}`;
+
+	const result = await transform(wrapped, {
+		loader: "ts",
+		minify: false,
+		keepNames: false,
+		target: "es2022",
+	});
+
+	const transformed = result.code;
+
+	const fnStart = transformed.indexOf(`async function ${WRAPPER_FN}()`);
+	if (fnStart === -1) throw new Error("Could not find wrapper function in transformed output");
+
+	const openBrace = transformed.indexOf("{", fnStart);
+	if (openBrace === -1) throw new Error("Could not find opening brace in transformed output");
+
+	const endMarker = transformed.indexOf(WRAPPER_END);
+	if (endMarker === -1) throw new Error("Could not find end marker in transformed output");
+
+	const body = transformed.substring(openBrace + 1, endMarker);
+	const closingBrace = body.lastIndexOf("}");
+	if (closingBrace === -1) throw new Error("Could not find closing brace in transformed output");
+
+	return body.substring(0, closingBrace).trim();
+}
+
+/**
  * Execute a TypeScript/JavaScript code string inside a V8 isolate.
  *
- * - external_* functions are bridged as async callbacks.
- * - console.log/warn/error are captured.
- * - The code is wrapped in an async function so top-level `return` works.
- * - Type annotations are stripped with a simple regex pass.
+ * - TypeScript is stripped via esbuild (fast, handles all TS syntax)
+ * - external_* functions are bridged as async References
+ * - Tool results are serialized as { success, value/error } JSON for safe isolate boundary crossing
+ * - console.log/warn/error are captured
+ * - The code is wrapped in an async IIFE so top-level `return` works
  */
 export async function executeInSandbox(
 	code: string,
@@ -35,70 +81,103 @@ export async function executeInSandbox(
 	const start = Date.now();
 	const consoleOutput: string[] = [];
 
+	// Strip TypeScript before entering the isolate
+	let strippedCode: string;
+	try {
+		strippedCode = await stripTypeScript(code);
+	} catch (err) {
+		return {
+			success: false,
+			error: `TypeScript error: ${err instanceof Error ? err.message : String(err)}`,
+			consoleOutput: [],
+			duration: Date.now() - start,
+		};
+	}
+
 	const isolate = new ivm.Isolate({ memoryLimit: MEMORY_LIMIT_MB });
 
 	try {
 		const context = await isolate.createContext();
 		const jail = context.global;
 
-		// Set up console capture
-		await jail.set("__consoleLog", new ivm.Callback((msg: string) => {
+		// Set up console capture using Reference.applySync for reliability
+		const logRef = new ivm.Reference((msg: string) => {
 			consoleOutput.push(msg);
-		}));
+		});
+		await jail.set("__logRef", logRef);
 
-		// Set up each external_* function as a Reference (v5 async support)
+		// Set up each external_* function as a Reference
+		// Tool results are wrapped in { success, value/error } JSON so errors
+		// propagate cleanly across the isolate boundary (pattern from TanStack)
 		for (const ext of externals) {
-			const refName = `__external_${ext.name}`;
 			await jail.set(
-				refName,
+				`__ref_${ext.name}`,
 				new ivm.Reference(async (paramsJson: string) => {
-					return await ext.handler(paramsJson);
+					try {
+						const result = await ext.handler(paramsJson);
+						return JSON.stringify({ success: true, value: result });
+					} catch (err) {
+						const message = err instanceof Error ? err.message : String(err);
+						return JSON.stringify({ success: false, error: message });
+					}
 				}),
 			);
 		}
 
-		// Build bootstrap script that wires console + external functions
+		// Build bootstrap: console + external function wrappers
 		const externalDeclarations = externals
 			.map(
 				(ext) => `
 async function external_${ext.name}(params) {
-  return await __external_${ext.name}.apply(undefined, [JSON.stringify(params)], { result: { promise: true } });
+  const json = await __ref_${ext.name}.applySyncPromise(undefined, [JSON.stringify(params)]);
+  const res = JSON.parse(json);
+  if (!res.success) throw new Error(res.error);
+  return typeof res.value === 'string' ? res.value : res.value;
 }`,
 			)
 			.join("\n");
 
 		const bootstrap = `
 const console = {
-  log: (...args) => __consoleLog(args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')),
-  warn: (...args) => __consoleLog('[warn] ' + args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')),
-  error: (...args) => __consoleLog('[error] ' + args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')),
-  info: (...args) => __consoleLog(args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')),
+  log: (...args) => __logRef.applySync(undefined, [args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')]),
+  warn: (...args) => __logRef.applySync(undefined, ['[warn] ' + args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')]),
+  error: (...args) => __logRef.applySync(undefined, ['[error] ' + args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')]),
+  info: (...args) => __logRef.applySync(undefined, [args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a)).join(' ')]),
 };
-
 ${externalDeclarations}
 `;
 
-		// Strip TypeScript annotations (simple approach)
-		const strippedCode = stripTypeAnnotations(code);
-
-		// Wrap in async IIFE so top-level return works
+		// Wrap in async IIFE, serialize result as JSON for safe isolate boundary crossing
 		const fullScript = `
 ${bootstrap}
 
 (async () => {
+  try {
+    const __result = await (async () => {
 ${strippedCode}
-})().then(result => {
-  if (result !== undefined) {
-    return typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
+    })();
+    return JSON.stringify(__result);
+  } catch (__err) {
+    throw __err;
   }
-  return undefined;
-});
+})()
 `;
 
 		const script = await isolate.compileScript(fullScript);
-		const resultRef = await script.run(context, { timeout: TIMEOUT_MS, promise: true });
+		const rawResult = await script.run(context, { timeout: TIMEOUT_MS, promise: true });
 
-		const result = typeof resultRef === "string" ? resultRef : resultRef !== undefined ? String(resultRef) : undefined;
+		// Parse the JSON-serialized result
+		let result: string | undefined;
+		if (typeof rawResult === "string") {
+			try {
+				const parsed = JSON.parse(rawResult);
+				result = typeof parsed === "object" ? JSON.stringify(parsed, null, 2) : String(parsed);
+			} catch {
+				result = rawResult;
+			}
+		} else if (rawResult !== undefined) {
+			result = String(rawResult);
+		}
 
 		return {
 			success: true,
@@ -117,42 +196,4 @@ ${strippedCode}
 	} finally {
 		isolate.dispose();
 	}
-}
-
-/**
- * Crude TypeScript annotation stripper. Removes:
- * - `: Type` annotations on parameters and variables
- * - `<Generic>` type parameters
- * - `as Type` casts
- * - `interface` and `type` declarations
- *
- * This is intentionally simple. Full TS→JS requires a real compiler,
- * but for the short snippets the LLM writes, this works well enough.
- */
-function stripTypeAnnotations(code: string): string {
-	let result = code;
-
-	// Remove interface/type declarations (whole lines)
-	result = result.replace(/^(export\s+)?(interface|type)\s+\w+[^{]*\{[^}]*\}/gm, "");
-	result = result.replace(/^(export\s+)?type\s+\w+\s*=\s*[^;\n]+;?/gm, "");
-
-	// Remove `as Type` casts
-	result = result.replace(/\s+as\s+\w+(\[\])?/g, "");
-
-	// Remove generic type parameters on function calls: fn<Type>(
-	result = result.replace(/(\w+)<[^>]+>\(/g, "$1(");
-
-	// Remove parameter type annotations: (param: Type) -> (param)
-	// Handle multi-param: (a: string, b: number) -> (a, b)
-	// Only match after ( or , (function parameter position) to avoid clobbering
-	// object literal keys like { path: "...", limit: 5 }
-	result = result.replace(/([,(]\s*)(\w+)\s*:\s*[\w<>\[\]|&\s]+(?=[,)])/g, "$1$2");
-
-	// Remove variable type annotations: const x: Type = -> const x =
-	result = result.replace(/(const|let|var)\s+(\w+)\s*:\s*[\w<>\[\]|&\s,{}]+\s*=/g, "$1 $2 =");
-
-	// Remove return type annotations: ): Type => -> ) =>
-	result = result.replace(/\)\s*:\s*[\w<>\[\]|&\s,{}]+\s*=>/g, ") =>");
-
-	return result;
 }
