@@ -31,6 +31,29 @@ The key insight from the [TanStack article](https://tanstack.com/blog/tanstack-a
 - **Correct math** — aggregation, counting, and transforms happen in JS, not token prediction
 - **Fewer round-trips** — the model thinks once, then code runs to completion
 
+## What's Included
+
+Inside `execute_typescript`, Code Mode directly bridges these core pi tools:
+
+- `external_read()`
+- `external_bash()`
+- `external_write()`
+- `external_edit()`
+- `external_grep()`
+- `external_find()`
+- `external_ls()`
+
+It also injects helper utilities so the model can work at a higher level with less boilerplate, including:
+
+- `readText()`, `readLines()`, `readJson()`, `readMany()`
+- `readAsset()` for image-aware reads
+- `bashResult()`, `bashLines()`, `bashJson()`
+- `grepResult()`, `grepEntries()`, `findPaths()`, `lsEntries()`
+- `previewEdits()`, `applyFileEdits()`, `batchEdits()`
+- `mapLimit()`, `chunk()`, `lines()`, `dedent()`, `callTool()`, `mustCallTool()`
+
+This merged version also adds safer structured tool results, batched edit helpers, and much better TypeScript/runtime error formatting.
+
 ## Install
 
 ```bash
@@ -45,20 +68,20 @@ pi -e git:github.com/juanrgon/pi-code-mode
 
 ## Usage
 
-Toggle Code Mode with:
+Code Mode starts enabled by default and shows its state in the footer. Toggle it with:
 
 - `/code-mode` command
 - `Ctrl+Alt+C` shortcut
 
-When enabled, the LLM gets an `execute_typescript` tool in addition to the normal tools. The system prompt is augmented with typed stubs so the model knows exactly how to call `external_read()`, `external_bash()`, `external_edit()`, etc.
+When enabled, the LLM gets an `execute_typescript` tool in addition to the normal tools. Inside `execute_typescript`, the sandbox exposes typed `external_*` wrappers for the bridged core tools above, plus the higher-level helper functions.
 
 The code runs in a V8 isolate ([`isolated-vm`](https://github.com/nicolo-ribaudo/isolated-vm)) with a 120-second timeout and 128MB memory limit. Each execution gets a fresh sandbox — no state leaks between calls.
 
 ## How It Works
 
-- **`index.ts`** — Extension entry point. Registers the tool, command, shortcut, and bridges pi's tools into the sandbox as `external_*` async functions.
-- **`sandbox.ts`** — V8 isolate sandbox. Handles async tool bridging via `ivm.Reference`, console capture, and TypeScript annotation stripping.
-- **`stubs.ts`** — Generates typed TypeScript declarations from all active tools, injected into the system prompt so the model writes correct calls without guessing parameter shapes.
+- **`index.ts`** — Extension entry point. Registers the tool, command, shortcut, footer status, and bridges the supported core tools into the sandbox.
+- **`sandbox.ts`** — V8 isolate sandbox. Handles async tool bridging via `ivm.Reference`, helper injection, console capture, and better TypeScript/runtime error formatting.
+- **`stubs.ts`** — Generates typed `external_*` declarations plus helper stubs/examples, injected into the system prompt so the model writes correct calls without guessing parameter shapes.
 
 ## License
 
