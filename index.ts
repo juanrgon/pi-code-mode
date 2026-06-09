@@ -19,8 +19,8 @@
 import { resolve, dirname, extname } from "node:path";
 import { readFile, writeFile, mkdir, readdir } from "node:fs/promises";
 import { Type } from "@sinclair/typebox";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Key } from "@mariozechner/pi-tui";
+import { highlightCode, keyHint, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Key, Text } from "@mariozechner/pi-tui";
 import { executeInSandbox, type ExternalFunction } from "./sandbox.js";
 import { buildCodeModeSystemPrompt, type ToolSchema } from "./stubs.js";
 
@@ -366,6 +366,28 @@ export default function codeModeExtension(pi: ExtensionAPI): void {
 					"Top-level `return` produces the result. console.log() is captured.",
 			}),
 		}),
+
+		renderCall(args, theme, context) {
+			const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+			const code = typeof args?.code === "string" ? args.code.replace(/\r\n?/g, "\n") : "";
+			if (!code) {
+				text.setText(theme.fg("dim", "⚡ TypeScript — receiving code…"));
+				return text;
+			}
+
+			const highlighted = highlightCode(code, "typescript");
+			const maxLines = context.expanded ? highlighted.length : 14;
+			let body = highlighted.slice(0, maxLines).join("\n");
+			if (highlighted.length > maxLines) {
+				body +=
+					"\n" +
+					theme.fg("muted", `… ${highlighted.length - maxLines} more lines, `) +
+					keyHint("app.tools.expand", "to expand");
+			}
+
+			text.setText(theme.fg("toolTitle", theme.bold("⚡ TypeScript")) + "\n" + body);
+			return text;
+		},
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			if (!enabled) {
