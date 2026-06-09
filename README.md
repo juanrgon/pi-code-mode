@@ -27,12 +27,12 @@ One tool call in the conversation. Intermediate file contents never touch the co
 This is a ground-up rewrite of the original isolated-vm version:
 
 - **Real parallelism.** Bridged calls cross the sandbox boundary as async messages, so `Promise.all` / `mapLimit` genuinely run tools concurrently on the host (bounded, default 8). The v1 bridge (`applySyncPromise`) silently serialized everything — two parallel 1s sleeps took ~2s; now they take ~1s. A regression test locks this in.
-- **Delegates to pi's real tools.** `tools.read`, `tools.bash`, etc. call pi's actual built-in implementations (`create*ToolDefinition`), inheriting output truncation, the per-file mutation queue (concurrent edits don't clobber each other), image handling, and every future improvement — instead of maintaining a drifting reimplementation.
+- **Delegates to pi's real tools.** `tools.read`, `tools.bash`, etc. call pi's actual built-in implementations (`create*ToolDefinition`), inheriting output truncation, the per-file mutation queue (concurrent edits don't clobber each other), image handling, and every future improvement — instead of maintaining a drifting reimplementation. Tools the user disabled stay unavailable inside the sandbox too.
 - **Cancellation works.** Esc aborts the run: in-flight tools receive the abort signal and the worker is terminated — even mid-`while(true)`.
 - **Output discipline.** The final result is truncated to pi's standard limits (2000 lines / 50KB), with the full output saved to a temp file. Sandbox-side, tool output arrives already truncated by the real tools.
 - **Audit trail.** Every bridged call is recorded (tool, params, duration, ok/error) in the tool result details and rendered in the TUI when expanded.
 - **No native deps.** `worker_threads` + `node:vm` with a memory cap replaces `isolated-vm` (a native, maintenance-mode dependency). Only runtime dependency is esbuild, used to strip TypeScript.
-- **~3× smaller prompt.** One consistent `tools.*` API with structured results replaces the v1 dual surface (`external_*` strings + 25 helper wrappers). The injected prompt dropped from ~450 lines to ~140.
+- **~3× smaller prompt, injected per turn.** One consistent `tools.*` API with structured results replaces the v1 dual surface (`external_*` strings + 25 helper wrappers). The injected prompt dropped from ~450 lines to ~122 (~2K tokens), and it now extends the system prompt for the current turn instead of appending a persistent message to the session on every prompt (a v1 bug that duplicated the whole block each turn).
 
 ## Sandbox API
 
@@ -75,13 +75,17 @@ Code Mode starts enabled (additive) and shows its state in the footer.
 
 **Additive** (default): `execute_typescript` is available alongside the normal tools. The model is told to use it for multi-step work with loops/branching/aggregation and to keep using direct tool calls for single operations.
 
-**Replace**: the seven bridged built-in tools are hidden from the model and only reachable through `execute_typescript` (CodeAct-style; saves tool-schema tokens, forces orchestration through code).
+**Replace**: the bridged built-in tools that were active when you enabled replace are hidden from the model and only reachable through `execute_typescript` (CodeAct-style; saves tool-schema tokens, forces orchestration through code). Leaving replace restores exactly that set — tools you had disabled stay disabled.
+
+**Off**: `execute_typescript` itself is deactivated and the Code Mode prompt is not injected.
 
 ## Security model
 
 This is **resource isolation, not a security boundary**. The sandbox (fresh `worker_threads` Worker per run, `node:vm` context, 256MB heap cap, 120s wall-clock timeout, no require/process/network) keeps runs bounded and forces all side effects through the bridged tools — but `tools.bash` is arbitrary command execution, exactly like pi's normal bash tool. Code Mode neither adds nor removes authority; it changes how the model expresses multi-step work.
 
-Known limitation: bridged calls go straight to the tool implementations, bypassing `tool_call`/`tool_result` extension hooks (e.g. permission-gate extensions). See [UPSTREAM_PROPOSAL.md](UPSTREAM_PROPOSAL.md) for the pi API that would fix this properly.
+Known limitations:
+
+- Bridged calls go straight to pi's stock tool implementations, bypassing `tool_call`/`tool_result` extension hooks (e.g. permission-gate extensions) **and** any built-in tool overrides or remote-operation adapters (SSH/sandbox extensions) you may have installed — Code Mode always executes the local built-ins. See [UPSTREAM_PROPOSAL.md](UPSTREAM_PROPOSAL.md) for the `pi.invokeTool()` API that would fix both properly and let Code Mode bridge third-party tools.
 
 ## How it works
 

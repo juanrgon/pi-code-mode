@@ -81,16 +81,18 @@ export function createBridgedDefinitions(cwd: string): Record<BridgedToolName, B
 
 /**
  * Build runner executors that delegate to pi's real tool definitions.
+ * Only tools in `allowed` are bridged (respects user-disabled tools).
  * Exported for tests so the test bridge cannot drift from the runtime bridge.
  */
 export function createBridgedExecutors(
 	defs: Record<BridgedToolName, BridgedDefinition>,
 	ctx: ExtensionContext,
 	idPrefix: string,
+	allowed: readonly BridgedToolName[] = BRIDGED_TOOL_NAMES,
 ): Record<string, ToolExecutor> {
 	let callSequence = 0;
 	const executors: Record<string, ToolExecutor> = {};
-	for (const name of BRIDGED_TOOL_NAMES) {
+	for (const name of allowed) {
 		executors[name] = async (rawParams, toolSignal) => {
 			const def = defs[name];
 			const prepared = def.prepareArguments ? def.prepareArguments(rawParams) : rawParams;
@@ -195,6 +197,8 @@ export async function buildResultText(outcome: RunOutcome): Promise<{ text: stri
 export default function codeModeExtension(pi: ExtensionAPI): void {
 	let enabled = true;
 	let replace = false;
+	/** Bridged tools hidden by replace mode (snapshot of what was active when replace was enabled). */
+	let replaceHidden: BridgedToolName[] = [];
 	const definitionsCache = new Map<string, Record<BridgedToolName, BridgedDefinition>>();
 	const promptCache = new Map<string, string>();
 
@@ -207,17 +211,39 @@ export default function codeModeExtension(pi: ExtensionAPI): void {
 		return defs;
 	}
 
-	function promptFor(cwd: string): string {
-		let prompt = promptCache.get(cwd);
+	function isBridged(name: string): name is BridgedToolName {
+		return (BRIDGED_TOOL_NAMES as readonly string[]).includes(name);
+	}
+
+	/** Bridged tools that are currently active (respects tools the user disabled). */
+	function activeBridged(): BridgedToolName[] {
+		const active = new Set(pi.getActiveTools());
+		return BRIDGED_TOOL_NAMES.filter((name) => active.has(name));
+	}
+
+	/**
+	 * The bridged tools Code Mode may orchestrate right now. In additive mode
+	 * this is the currently active bridged set (a tool the user disabled stays
+	 * unavailable inside the sandbox too). In replace mode it is the snapshot
+	 * taken when replace was enabled.
+	 */
+	function allowedBridged(): BridgedToolName[] {
+		if (enabled && replace) return [...replaceHidden];
+		return activeBridged();
+	}
+
+	function promptFor(cwd: string, allowed: BridgedToolName[]): string {
+		const key = `${cwd}|${allowed.join(",")}`;
+		let prompt = promptCache.get(key);
 		if (!prompt) {
 			const defs = definitionsFor(cwd);
-			const schemas: BridgedToolSchema[] = BRIDGED_TOOL_NAMES.map((name) => ({
+			const schemas: BridgedToolSchema[] = allowed.map((name) => ({
 				name,
 				description: defs[name].description,
 				parameters: defs[name].parameters,
 			}));
 			prompt = buildCodeModePrompt(schemas);
-			promptCache.set(cwd, prompt);
+			promptCache.set(key, prompt);
 		}
 		return prompt;
 	}
@@ -238,28 +264,45 @@ export default function codeModeExtension(pi: ExtensionAPI): void {
 		);
 	}
 
-	/** In replace mode, hide the bridged built-ins; otherwise make sure they are active. */
-	function applyToolVisibility(): void {
-		const bridged = new Set<string>(BRIDGED_TOOL_NAMES);
-		const allNames = new Set(pi.getAllTools().map((t) => t.name));
-		const active = pi.getActiveTools();
-		if (enabled && replace) {
-			pi.setActiveTools(active.filter((name) => !bridged.has(name)));
-		} else {
-			const next = new Set(active);
-			for (const name of BRIDGED_TOOL_NAMES) {
-				if (allNames.has(name)) next.add(name);
-			}
-			if (next.size !== active.length) pi.setActiveTools([...next]);
+	/**
+	 * Apply mode transitions to the active tool set:
+	 * - entering replace: snapshot the active bridged tools and hide them
+	 * - leaving replace: restore exactly that snapshot (nothing else)
+	 * - enabled controls whether execute_typescript itself is active
+	 * Tools the user disabled are never re-enabled by Code Mode.
+	 */
+	function applyMode(nextEnabled: boolean, nextReplace: boolean): void {
+		const wasReplacing = enabled && replace;
+		const willReplace = nextEnabled && nextReplace;
+
+		if (wasReplacing && !willReplace) {
+			const next = new Set(pi.getActiveTools());
+			for (const name of replaceHidden) next.add(name);
+			pi.setActiveTools([...next]);
+			replaceHidden = [];
+		} else if (!wasReplacing && willReplace) {
+			replaceHidden = activeBridged();
+			const hidden = new Set<string>(replaceHidden);
+			pi.setActiveTools(pi.getActiveTools().filter((name) => !hidden.has(name)));
 		}
+
+		enabled = nextEnabled;
+		replace = nextReplace;
+
+		const active = new Set(pi.getActiveTools());
+		if (enabled) active.add("execute_typescript");
+		else active.delete("execute_typescript");
+		pi.setActiveTools([...active]);
+	}
+
+	function persistState(): void {
+		pi.appendEntry("code-mode-state", { enabled, replace, replaceHidden });
 	}
 
 	function setMode(ctx: ExtensionContext, nextEnabled: boolean, nextReplace: boolean): void {
-		enabled = nextEnabled;
-		replace = nextReplace;
-		applyToolVisibility();
+		applyMode(nextEnabled, nextReplace);
 		updateStatus(ctx);
-		pi.appendEntry("code-mode-state", { enabled, replace });
+		persistState();
 		ctx.ui.notify(`Code Mode: ${modeLabel()}`, "info");
 	}
 
@@ -378,7 +421,7 @@ export default function codeModeExtension(pi: ExtensionAPI): void {
 			}
 
 			const defs = definitionsFor(ctx.cwd);
-			const executors = createBridgedExecutors(defs, ctx, toolCallId);
+			const executors = createBridgedExecutors(defs, ctx, toolCallId, allowedBridged());
 
 			onUpdate?.({ content: [{ type: "text", text: "⚡ running…" }], details: undefined });
 
@@ -428,16 +471,14 @@ export default function codeModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// ── system prompt injection ──────────────────────────────────────────
+	// ── system prompt injection (per turn, NOT a persistent message) ────
 
-	pi.on("before_agent_start", async (_event, ctx) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		if (!enabled) return;
+		const allowed = allowedBridged();
+		if (allowed.length === 0) return;
 		return {
-			message: {
-				customType: "code-mode-context",
-				content: promptFor(ctx.cwd),
-				display: false,
-			},
+			systemPrompt: `${event.systemPrompt}\n\n${promptFor(ctx.cwd, allowed)}`,
 		};
 	});
 
@@ -445,13 +486,41 @@ export default function codeModeExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		for (const entry of ctx.sessionManager.getEntries()) {
-			const e = entry as { type: string; customType?: string; data?: { enabled?: boolean; replace?: boolean } };
+			const e = entry as {
+				type: string;
+				customType?: string;
+				data?: { enabled?: boolean; replace?: boolean; replaceHidden?: string[] };
+			};
 			if (e.type === "custom" && e.customType === "code-mode-state") {
 				enabled = e.data?.enabled ?? true;
 				replace = e.data?.replace ?? false;
+				replaceHidden = (e.data?.replaceHidden ?? []).filter(isBridged);
 			}
 		}
-		applyToolVisibility();
+		// Re-apply the restored mode to the fresh tool state.
+		if (enabled && replace) {
+			if (replaceHidden.length === 0) replaceHidden = activeBridged();
+			const hidden = new Set<string>(replaceHidden);
+			const next = pi.getActiveTools().filter((name) => !hidden.has(name));
+			if (!next.includes("execute_typescript")) next.push("execute_typescript");
+			pi.setActiveTools(next);
+		} else {
+			const active = new Set(pi.getActiveTools());
+			if (enabled) active.add("execute_typescript");
+			else active.delete("execute_typescript");
+			pi.setActiveTools([...active]);
+		}
 		updateStatus(ctx);
+	});
+
+	// On shutdown (quit/reload/session switch), restore tools hidden by replace
+	// mode so the next runtime starts from the user's real tool set; the
+	// persisted state re-hides them on session_start if replace is still on.
+	pi.on("session_shutdown", async () => {
+		if (enabled && replace && replaceHidden.length > 0) {
+			const next = new Set(pi.getActiveTools());
+			for (const name of replaceHidden) next.add(name);
+			pi.setActiveTools([...next]);
+		}
 	});
 }
