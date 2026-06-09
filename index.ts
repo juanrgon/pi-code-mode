@@ -158,6 +158,9 @@ export async function buildResultText(outcome: RunOutcome): Promise<{ text: stri
 				.map((entry) => (entry.level === "log" || entry.level === "info" ? entry.text : `[${entry.level}] ${entry.text}`))
 				.join("\n"),
 		);
+		if (outcome.consoleDropped > 0) {
+			parts.push(`[console truncated: ${outcome.consoleDropped} more entr${outcome.consoleDropped === 1 ? "y" : "ies"} dropped]`);
+		}
 	}
 	if (outcome.ok) {
 		if (outcome.result !== undefined) {
@@ -172,7 +175,7 @@ export async function buildResultText(outcome: RunOutcome): Promise<{ text: stri
 	}
 
 	const seconds = (outcome.durationMs / 1000).toFixed(1);
-	const callCount = outcome.calls.length;
+	const callCount = outcome.callsTotal;
 	const statusLine = `${outcome.ok ? "✓" : "✗"} ${callCount} tool call${callCount === 1 ? "" : "s"} · ${seconds}s`;
 
 	let text = parts.join("\n");
@@ -187,8 +190,8 @@ export async function buildResultText(outcome: RunOutcome): Promise<{ text: stri
 	}
 
 	const keptImages = outcome.images.slice(0, MAX_RESULT_IMAGES);
-	if (outcome.images.length > keptImages.length) {
-		text += `\n[${outcome.images.length - keptImages.length} additional image(s) omitted — read them directly with the read tool]`;
+	if (outcome.imagesTotal > keptImages.length) {
+		text += `\n[${outcome.imagesTotal - keptImages.length} additional image(s) omitted — read them directly with the read tool]`;
 	}
 	text += `\n\n${statusLine}`;
 	return { text, truncated: truncation.truncated };
@@ -343,13 +346,13 @@ export default function codeModeExtension(pi: ExtensionAPI): void {
 		name: "execute_typescript",
 		label: "Execute TypeScript",
 		description:
-			"Execute a TypeScript program in a sandbox. The code calls the bridged pi tools via " +
-			"tools.read(), tools.bash(), tools.edit(), etc. (same parameters and behavior as the " +
-			"normal tools), composes them with loops/conditionals, runs independent calls in " +
-			"parallel via Promise.all, and does math/aggregation in code. End with a top-level " +
-			"`return`; console.log output is captured.",
+			"Execute a TypeScript program in a sandbox. The code orchestrates the bridged pi core " +
+			"tools through the tools.* API documented in the Code Mode section of the system prompt " +
+			"(same parameters and behavior as the normal tools), composes them with loops and " +
+			"conditionals, runs independent calls in parallel via Promise.all, and does " +
+			"math/aggregation in code. End with a top-level `return`; console.log output is captured.",
 		promptSnippet:
-			"Run TypeScript that composes the core tools (tools.read, tools.bash, ...) with loops, parallelism, and aggregation",
+			"Run TypeScript that composes the bridged core tools (tools.* API) with loops, parallelism, and aggregation",
 		promptGuidelines: [
 			"Use execute_typescript for multi-step work that needs loops, branching on tool results, or aggregation across many files.",
 			"Inside execute_typescript, independent tools.* calls run concurrently — use Promise.all or mapLimit.",

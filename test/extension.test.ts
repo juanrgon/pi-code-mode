@@ -17,6 +17,9 @@ type CommandHandler = (args: string | undefined, ctx: ExtensionContext) => Promi
 
 interface RegisteredTool {
 	name: string;
+	description: string;
+	promptSnippet?: string;
+	promptGuidelines?: string[];
 	execute: (
 		toolCallId: string,
 		params: { code: string },
@@ -147,6 +150,20 @@ describe("mode transitions", () => {
 		const last = fake.entries.filter((e) => e.customType === "code-mode-state").at(-1)!;
 		expect(last.data).toEqual({ enabled: true, replace: true, replaceHidden: BUILTINS });
 	});
+
+	test("replace then off restores the snapshot and removes execute_typescript", async () => {
+		fake.setActive([...BUILTINS.filter((n) => n !== "write"), "execute_typescript"]);
+		await fake.command("code-mode", "replace");
+		await fake.command("code-mode", "off");
+		expect(fake.getActive().sort()).toEqual([...BUILTINS.filter((n) => n !== "write")].sort());
+	});
+
+	test("session_shutdown during replace restores the hidden tools", async () => {
+		await fake.command("code-mode", "replace");
+		expect(fake.getActive()).not.toContain("bash");
+		await fake.emit("session_shutdown");
+		expect(fake.getActive()).toEqual(expect.arrayContaining(BUILTINS));
+	});
 });
 
 describe("disabled tools stay unavailable inside the sandbox", () => {
@@ -156,15 +173,24 @@ describe("disabled tools stay unavailable inside the sandbox", () => {
 		const results = (await fake.emit("before_agent_start", { systemPrompt: "BASE" })) as Array<{
 			systemPrompt?: string;
 		}>;
-		expect(results[0]!.systemPrompt).not.toContain("bash(params");
+		const injected = results[0]!.systemPrompt!.slice("BASE".length);
+		// The entire injected Code Mode section must not advertise bash in any form
+		// (tools.bash declaration, bashJson helper, bash examples).
+		expect(injected.toLowerCase()).not.toContain("bash");
+
+		// The registered tool metadata must not name specific tools either.
+		const meta = fake.tool("execute_typescript");
+		const metaText = [meta.description, meta.promptSnippet, ...(meta.promptGuidelines ?? [])].join(" ").toLowerCase();
+		expect(metaText).not.toContain("bash");
 
 		const cwd = await mkdtemp(join(tmpdir(), "pi-code-mode-ext-"));
 		const ctx = { ...(fake.ctx as object), cwd } as ExtensionContext;
 		const result = await fake
 			.tool("execute_typescript")
-			.execute("t1", { code: `const names = Object.keys(tools).sort();\nconst bash = await tools.try("bash", { command: "echo hi" });\nreturn { names, bashOk: bash.ok };` }, undefined, undefined, ctx);
+			.execute("t1", { code: `const names = Object.keys(tools).sort();\nconst bash = await tools.try("bash", { command: "echo hi" });\nreturn { names, bashOk: bash.ok, bashJsonType: typeof bashJson };` }, undefined, undefined, ctx);
 		const text = result.content[0].text!;
 		expect(text).toContain(`"bashOk": false`);
+		expect(text).toContain(`"bashJsonType": "undefined"`);
 		expect(text).not.toContain(`"bash",`);
 		expect(text).toContain(`"read"`);
 	});

@@ -51,8 +51,14 @@ export interface RunOutcome {
 	/** Formatted error text (with code frame when mappable). */
 	errorText?: string;
 	console: ConsoleEntry[];
+	/** Console entries dropped beyond the cap. */
+	consoleDropped: number;
+	/** Audit summaries (capped at maxCallSummaries; callsTotal counts all). */
 	calls: CallSummary[];
+	callsTotal: number;
 	images: BridgeImage[];
+	/** Total images produced, including ones not collected. */
+	imagesTotal: number;
 	durationMs: number;
 	timedOut: boolean;
 	aborted: boolean;
@@ -67,6 +73,8 @@ export interface RunOptions {
 	timeoutMs?: number;
 	/** Max bridged tool calls executing concurrently on the host. Default 8. */
 	maxConcurrentCalls?: number;
+	/** Max bridged tool calls per run; excess calls fail. Default 1000. */
+	maxTotalCalls?: number;
 	/** Worker heap cap in MB. Default 256. */
 	memoryLimitMb?: number;
 	onProgress?: (progress: { callsStarted: number; callsFinished: number; lastTool?: string }) => void;
@@ -75,6 +83,11 @@ export interface RunOptions {
 export const DEFAULT_TIMEOUT_MS = 120_000;
 export const DEFAULT_MAX_CONCURRENT_CALLS = 8;
 export const DEFAULT_MEMORY_LIMIT_MB = 256;
+export const DEFAULT_MAX_TOTAL_CALLS = 1_000;
+export const DEFAULT_MAX_CALL_SUMMARIES = 200;
+export const DEFAULT_MAX_CONSOLE_ENTRIES = 1_000;
+export const DEFAULT_MAX_CONSOLE_BYTES = 256 * 1024;
+export const DEFAULT_MAX_COLLECTED_IMAGES = 8;
 const PARAMS_PREVIEW_CHARS = 200;
 
 // ── TypeScript stripping ──────────────────────────────────────────────
@@ -215,19 +228,30 @@ export async function runCode(options: RunOptions): Promise<RunOutcome> {
 	const startedAt = Date.now();
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 	const maxConcurrent = Math.max(1, options.maxConcurrentCalls ?? DEFAULT_MAX_CONCURRENT_CALLS);
+	const maxTotalCalls = Math.max(1, options.maxTotalCalls ?? DEFAULT_MAX_TOTAL_CALLS);
 	const consoleOutput: ConsoleEntry[] = [];
+	let consoleDropped = 0;
+	let consoleBytes = 0;
 	const calls: CallSummary[] = [];
+	let callsTotal = 0;
 	const images: BridgeImage[] = [];
+	let imagesTotal = 0;
 
 	const stripped = await stripTypeScript(options.code);
+	const baseOutcome = () => ({
+		console: consoleOutput,
+		consoleDropped,
+		calls,
+		callsTotal,
+		images,
+		imagesTotal,
+		durationMs: Date.now() - startedAt,
+	});
 	if (!stripped.ok) {
 		return {
 			ok: false,
 			errorText: stripped.errorText,
-			console: consoleOutput,
-			calls,
-			images,
-			durationMs: Date.now() - startedAt,
+			...baseOutcome(),
 			timedOut: false,
 			aborted: false,
 		};
@@ -238,10 +262,7 @@ export async function runCode(options: RunOptions): Promise<RunOutcome> {
 		return {
 			ok: false,
 			errorText: "Aborted before execution started",
-			console: consoleOutput,
-			calls,
-			images,
-			durationMs: Date.now() - startedAt,
+			...baseOutcome(),
 			timedOut: false,
 			aborted: true,
 		};
@@ -303,21 +324,26 @@ export async function runCode(options: RunOptions): Promise<RunOutcome> {
 				ok: outcome.ok,
 				result: outcome.result,
 				errorText: outcome.errorText,
-				console: consoleOutput,
-				calls,
-				images,
-				durationMs: Date.now() - startedAt,
+				...baseOutcome(),
 				timedOut,
 				aborted,
 			});
 		}
 
 		options.signal?.addEventListener("abort", onExternalAbort, { once: true });
+		// Close the race where the signal aborts between the early check above and
+		// listener registration (an already-aborted signal does not fire listeners).
+		if (options.signal?.aborted) onExternalAbort();
 
 		worker.on("message", (message: WorkerMessage) => {
 			if (settled || !message) return;
 
 			if (message.type === "log") {
+				if (consoleOutput.length >= DEFAULT_MAX_CONSOLE_ENTRIES || consoleBytes >= DEFAULT_MAX_CONSOLE_BYTES) {
+					consoleDropped++;
+					return;
+				}
+				consoleBytes += message.text.length;
 				consoleOutput.push({ level: message.level, text: message.text });
 				return;
 			}
@@ -333,8 +359,10 @@ export async function runCode(options: RunOptions): Promise<RunOutcome> {
 			}
 
 			if (message.type === "call") {
+				callsTotal++;
 				const summary: CallSummary = { id: message.id, tool: message.tool, params: previewParams(message.params) };
-				calls.push(summary);
+				const trackSummary = calls.length < DEFAULT_MAX_CALL_SUMMARIES;
+				if (trackSummary) calls.push(summary);
 				const callStartedAt = Date.now();
 				callsStarted++;
 				options.onProgress?.({ callsStarted, callsFinished, lastTool: message.tool });
@@ -363,6 +391,10 @@ export async function runCode(options: RunOptions): Promise<RunOutcome> {
 					respond(false, `Tool is not available in Code Mode: ${message.tool}`);
 					return;
 				}
+				if (callsTotal > maxTotalCalls) {
+					respond(false, `Tool call limit reached (${maxTotalCalls} per execute_typescript run)`);
+					return;
+				}
 
 				void (async () => {
 					await acquire();
@@ -372,7 +404,11 @@ export async function runCode(options: RunOptions): Promise<RunOutcome> {
 							return;
 						}
 						const result = await executor(message.params, runAbort.signal);
-						if (result.images) images.push(...result.images);
+						if (result.images) {
+							imagesTotal += result.images.length;
+							const room = DEFAULT_MAX_COLLECTED_IMAGES - images.length;
+							if (room > 0) images.push(...result.images.slice(0, room));
+						}
 						respond(true, result.value);
 					} catch (error) {
 						respond(false, errorMessage(error));

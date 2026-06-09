@@ -4,7 +4,7 @@
  * and a couple of examples. Kept deliberately small — this text is injected
  * into every request while Code Mode is enabled.
  */
-import { SANDBOX_HELPER_NAMES } from "./worker-source.js";
+import { SANDBOX_HELPERS } from "./worker-source.js";
 
 export interface BridgedToolSchema {
 	name: string;
@@ -84,25 +84,29 @@ ${methods.join("\n\n")}
 };`;
 }
 
-const HELPERS_DECLARATION = `/** Split text into lines (drops one trailing empty line). */
-declare function lines(text: string): string[];
-/** Remove common leading indentation (useful for tools.write content). */
-declare function dedent(text: string): string;
-/** Run async work over items with bounded parallelism, preserving order. */
-declare function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]>;
-/** tools.read + JSON.parse. */
-declare function readJson<T = unknown>(path: string): Promise<T>;
-/** tools.bash + parse JSON from the output (accepts a command string or bash params). */
-declare function bashJson<T = unknown>(command: string | { command: string; timeout?: number }): Promise<T>;
-/** tools.grep + parse output into { path, line, text } entries (use without the context option). */
-declare function grepEntries(params: Parameters<typeof tools.grep>[0]): Promise<Array<{ path: string; line: number; text: string }>>;`;
+const HELPER_DOCS: Record<string, string> = {
+	lines: `/** Split text into lines (drops one trailing empty line). */
+declare function lines(text: string): string[];`,
+	dedent: `/** Remove common leading indentation (useful for tools.write content). */
+declare function dedent(text: string): string;`,
+	mapLimit: `/** Run async work over items with bounded parallelism, preserving order. */
+declare function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]>;`,
+	readJson: `/** tools.read + JSON.parse. */
+declare function readJson<T = unknown>(path: string): Promise<T>;`,
+	bashJson: `/** tools.bash + parse JSON from the output (accepts a command string or bash params). */
+declare function bashJson<T = unknown>(command: string | { command: string; timeout?: number }): Promise<T>;`,
+	grepEntries: `/** tools.grep + parse output into { path, line, text } entries (use without the context option). */
+declare function grepEntries(params: Parameters<typeof tools.grep>[0]): Promise<Array<{ path: string; line: number; text: string }>>;`,
+};
 
-// Compile-time check that the docs above cover exactly the sandbox helpers.
-type HelperName = (typeof SANDBOX_HELPER_NAMES)[number];
-const documentedHelpers: readonly HelperName[] = ["lines", "dedent", "mapLimit", "readJson", "bashJson", "grepEntries"];
-void documentedHelpers;
+/** Helper declarations for the helpers available given the allowed tool set. */
+function buildHelpersDeclaration(allowedNames: Set<string>): string {
+	return SANDBOX_HELPERS.filter((helper) => helper.requires === undefined || allowedNames.has(helper.requires))
+		.map((helper) => HELPER_DOCS[helper.name])
+		.join("\n");
+}
 
-const EXAMPLES = `Summarize matches across many files (parallel, bounded):
+const GREP_READ_EXAMPLE = `Summarize matches across many files (parallel, bounded):
 
 \`\`\`typescript
 const entries = await grepEntries({ pattern: "TODO", glob: "*.ts" });
@@ -112,9 +116,9 @@ const sizes = await mapLimit(byFile, 8, async (path) => {
   return { path, lines: lines(r.text).length };
 });
 return { todos: entries.length, files: sizes };
-\`\`\`
+\`\`\``;
 
-Run a command, branch on the outcome, then edit:
+const BASH_EDIT_EXAMPLE = `Run a command, branch on the outcome, then edit:
 
 \`\`\`typescript
 const check = await tools.try("bash", { command: "npm run check", timeout: 120 });
@@ -126,7 +130,25 @@ const fix = await tools.edit({
 return { error: check.error.slice(0, 400), diff: fix.diff };
 \`\`\``;
 
+function genericExample(toolName: string): string {
+	return `Compose calls with loops and aggregation:
+
+\`\`\`typescript
+const result = await tools.${toolName}({} as never); // fill in params
+return { lines: lines(result.text).length };
+\`\`\``;
+}
+
+function buildExamples(allowedNames: Set<string>): string {
+	const examples: string[] = [];
+	if (allowedNames.has("grep") && allowedNames.has("read")) examples.push(GREP_READ_EXAMPLE);
+	if (allowedNames.has("bash") && allowedNames.has("edit")) examples.push(BASH_EDIT_EXAMPLE);
+	if (examples.length === 0) examples.push(genericExample([...allowedNames][0] ?? "read"));
+	return examples.join("\n\n");
+}
+
 export function buildCodeModePrompt(tools: BridgedToolSchema[]): string {
+	const allowedNames = new Set(tools.map((t) => t.name));
 	return `## Code Mode
 
 You have an \`execute_typescript\` tool. Instead of calling tools one at a time, you can
@@ -139,7 +161,7 @@ and data transformations. Bridged tool calls execute concurrently on the host, s
 \`\`\`typescript
 ${buildToolsDeclaration(tools)}
 
-${HELPERS_DECLARATION}
+${buildHelpersDeclaration(allowedNames)}
 \`\`\`
 
 These are the same tools you normally call directly (same parameters, same truncation
@@ -147,7 +169,7 @@ behavior); failures throw an \`Error\` whose message is the tool's error text.
 
 ### Examples
 
-${EXAMPLES}
+${buildExamples(allowedNames)}
 
 ### Rules
 

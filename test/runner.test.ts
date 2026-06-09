@@ -125,11 +125,11 @@ describe("runCode basics", () => {
 
 	test("helpers are available in the sandbox", async () => {
 		const outcome = await runCode({
-			code: `return [typeof lines, typeof dedent, typeof mapLimit, typeof readJson, typeof bashJson, typeof grepEntries];`,
+			code: `return [typeof lines, typeof dedent, typeof mapLimit];`,
 			tools: {},
 		});
 		expect(outcome.ok).toBe(true);
-		expect(outcome.result).toEqual(["function", "function", "function", "function", "function", "function"]);
+		expect(outcome.result).toEqual(["function", "function", "function"]);
 	});
 
 	test("mapLimit preserves order with bounded concurrency", async () => {
@@ -179,6 +179,47 @@ describe("runCode concurrency", () => {
 		});
 		expect(outcome.ok).toBe(true);
 		expect(peak).toBe(2);
+	});
+});
+
+describe("runCode resource limits", () => {
+	test("call floods are rejected past maxTotalCalls and summaries are capped", async () => {
+		const outcome = await runCode({
+			code: `const results = await Promise.all(Array.from({ length: 1200 }, () => tools.try("echo", {})));\nreturn results.filter((r) => !r.ok).length;`,
+			tools: { echo: echoTool() },
+			maxConcurrentCalls: 32,
+		});
+		expect(outcome.ok).toBe(true);
+		expect(outcome.result).toBe(200); // 1200 - 1000 limit
+		expect(outcome.callsTotal).toBe(1200);
+		expect(outcome.calls.length).toBe(200); // summary cap
+	});
+
+	test("console floods are capped with a dropped count", async () => {
+		const outcome = await runCode({
+			code: `for (let i = 0; i < 3000; i++) console.log("line", i);\nreturn "done";`,
+			tools: {},
+		});
+		expect(outcome.ok).toBe(true);
+		expect(outcome.console.length).toBeLessThanOrEqual(1000);
+		expect(outcome.consoleDropped).toBeGreaterThanOrEqual(2000);
+	});
+
+	test("image collection is capped while the total is still counted", async () => {
+		const imageTool: ToolExecutor = async () => ({
+			value: { text: "img" },
+			images: [
+				{ data: "aaaa", mimeType: "image/png" },
+				{ data: "bbbb", mimeType: "image/png" },
+			],
+		});
+		const outcome = await runCode({
+			code: `await Promise.all(Array.from({ length: 6 }, () => tools.shot({})));\nreturn "done";`,
+			tools: { shot: imageTool },
+		});
+		expect(outcome.ok).toBe(true);
+		expect(outcome.images.length).toBeLessThanOrEqual(8);
+		expect(outcome.imagesTotal).toBe(12);
 	});
 });
 

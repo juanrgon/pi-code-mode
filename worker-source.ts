@@ -27,16 +27,18 @@
  * workerData: { code: string (plain JS body), toolNames: string[] }
  */
 
-/** Helper functions defined inside the sandbox. Single source of truth shared
- * with stubs.ts (prompt docs) and tests (runtime parity). */
-export const SANDBOX_HELPER_NAMES = [
-	"lines",
-	"dedent",
-	"mapLimit",
-	"readJson",
-	"bashJson",
-	"grepEntries",
+/** Helpers defined inside the sandbox, with the bridged tool each requires.
+ * Single source of truth shared with stubs.ts (prompt docs) and tests. */
+export const SANDBOX_HELPERS = [
+	{ name: "lines", requires: undefined },
+	{ name: "dedent", requires: undefined },
+	{ name: "mapLimit", requires: undefined },
+	{ name: "readJson", requires: "read" },
+	{ name: "bashJson", requires: "bash" },
+	{ name: "grepEntries", requires: "grep" },
 ] as const;
+
+export const SANDBOX_HELPER_NAMES = SANDBOX_HELPERS.map((h) => h.name);
 
 export const WORKER_SOURCE = String.raw`
 "use strict";
@@ -78,12 +80,15 @@ function jsonSafe(value) {
 }
 
 function formatConsoleArg(arg) {
-	if (typeof arg === "string") return arg;
+	if (typeof arg === "string") return arg.length > 10000 ? arg.slice(0, 10000) + "…[truncated]" : arg;
 	return util.inspect(arg, { depth: 4, maxArrayLength: 50, maxStringLength: 2000, breakLength: 100 });
 }
 
 function makeConsole(level) {
-	return (...args) => send({ type: "log", level, text: args.map(formatConsoleArg).join(" ") });
+	return (...args) => {
+		const text = args.map(formatConsoleArg).join(" ");
+		send({ type: "log", level, text: text.length > 20000 ? text.slice(0, 20000) + "…[truncated]" : text });
+	};
 }
 
 function callTool(tool, params) {
@@ -237,7 +242,7 @@ async function grepEntries(params) {
 
 // ── vm context + execution ────────────────────────────────────────────
 
-const context = vm.createContext({
+const contextGlobals = {
 	tools,
 	console: Object.freeze({
 		log: makeConsole("log"),
@@ -250,10 +255,13 @@ const context = vm.createContext({
 	lines,
 	dedent,
 	mapLimit,
-	readJson,
-	bashJson,
-	grepEntries,
-});
+};
+// Helpers that depend on a bridged tool exist only when that tool is bridged.
+if (toolNames.includes("read")) contextGlobals.readJson = readJson;
+if (toolNames.includes("bash")) contextGlobals.bashJson = bashJson;
+if (toolNames.includes("grep")) contextGlobals.grepEntries = grepEntries;
+
+const context = vm.createContext(contextGlobals);
 
 (async () => {
 	try {
