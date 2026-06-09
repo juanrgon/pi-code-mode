@@ -1,22 +1,21 @@
 /**
- * Generates TypeScript type stubs for all active pi tools so the LLM can
- * write typed code against them inside the sandbox.
+ * Builds the Code Mode system prompt section: typed `tools.*` declarations
+ * generated from the live tool schemas, result types, helper declarations,
+ * and a couple of examples. Kept deliberately small — this text is injected
+ * into every request while Code Mode is enabled.
  */
+import { SANDBOX_HELPER_NAMES } from "./worker-source.js";
 
-export interface ToolSchema {
+export interface BridgedToolSchema {
 	name: string;
 	description: string;
 	parameters: Record<string, unknown>;
 }
 
-/**
- * Convert a JSON Schema property to a rough TypeScript type string.
- */
+/** Convert a JSON Schema to a compact TypeScript type string. */
 function jsonSchemaToTS(schema: Record<string, unknown>, indent = 0): string {
 	const pad = "  ".repeat(indent);
-
 	if (!schema || typeof schema !== "object") return "unknown";
-
 	const type = schema.type as string | undefined;
 
 	if (type === "string") return "string";
@@ -26,422 +25,137 @@ function jsonSchemaToTS(schema: Record<string, unknown>, indent = 0): string {
 
 	if (type === "array") {
 		const items = schema.items as Record<string, unknown> | undefined;
-		if (items) return `Array<${jsonSchemaToTS(items, indent)}>`;
-		return "unknown[]";
+		return items ? `Array<${jsonSchemaToTS(items, indent)}>` : "unknown[]";
 	}
 
 	if (type === "object" || schema.properties) {
 		const props = schema.properties as Record<string, Record<string, unknown>> | undefined;
 		if (!props || Object.keys(props).length === 0) return "Record<string, unknown>";
-
 		const required = new Set((schema.required as string[]) ?? []);
-		const lines: string[] = ["{"];
+		const out: string[] = ["{"];
 		for (const [key, propSchema] of Object.entries(props)) {
 			const opt = required.has(key) ? "" : "?";
-			const desc = propSchema.description ? ` /** ${propSchema.description} */` : "";
-			lines.push(`${pad}  ${desc}`);
-			lines.push(`${pad}  ${key}${opt}: ${jsonSchemaToTS(propSchema, indent + 1)};`);
+			const desc = typeof propSchema.description === "string" ? ` /** ${propSchema.description} */` : "";
+			out.push(`${pad}  ${key}${opt}: ${jsonSchemaToTS(propSchema, indent + 1)};${desc}`);
 		}
-		lines.push(`${pad}}`);
-		return lines.join("\n");
+		out.push(`${pad}}`);
+		return out.join("\n");
 	}
 
-	// anyOf / oneOf
 	const anyOf = (schema.anyOf ?? schema.oneOf) as Record<string, unknown>[] | undefined;
-	if (anyOf) {
-		return anyOf.map((s) => jsonSchemaToTS(s, indent)).join(" | ");
-	}
-
-	// enum
-	if (schema.enum) {
-		return (schema.enum as unknown[]).map((v) => JSON.stringify(v)).join(" | ");
-	}
-
+	if (anyOf) return anyOf.map((s) => jsonSchemaToTS(s, indent)).join(" | ");
+	if (schema.enum) return (schema.enum as unknown[]).map((v) => JSON.stringify(v)).join(" | ");
 	return "unknown";
 }
 
-/**
- * Build the full TypeScript type stubs and declarations for external_* functions.
- */
-export function generateTypeStubs(tools: ToolSchema[]): string {
-	const declarations: string[] = [];
+/** Per-tool result type extras beyond `text` (must match the bridge in index.ts). */
+const RESULT_EXTRAS: Record<string, string> = {
+	read: `{ kind: "text" | "image"; truncated: boolean }`,
+	bash: `{ truncated: boolean; fullOutputPath?: string }`,
+	edit: `{ diff: string; firstChangedLine?: number }`,
+	write: `{}`,
+	grep: `{ truncated: boolean }`,
+	find: `{ truncated: boolean }`,
+	ls: `{ truncated: boolean }`,
+};
 
-	for (const tool of tools) {
-		const paramsType = jsonSchemaToTS(tool.parameters);
+const TOOL_NOTES: Record<string, string> = {
+	bash: " Throws on non-zero exit (the error message contains the output); use tools.try for fallible commands.",
+	read: " Reading an image attaches it to the final result (max 3 per run); result.text is just a marker.",
+};
 
-		declarations.push(`
-/**
- * ${tool.description}
- */
-declare function external_${tool.name}(params: ${paramsType}): Promise<string>;
-`);
-	}
+function buildToolsDeclaration(tools: BridgedToolSchema[]): string {
+	const methods = tools.map((tool) => {
+		const params = jsonSchemaToTS(tool.parameters, 1);
+		const extras = RESULT_EXTRAS[tool.name] ?? "{}";
+		const result = extras === "{}" ? "ToolText" : `ToolText & ${extras}`;
+		const note = TOOL_NOTES[tool.name] ?? "";
+		return `  /** ${tool.description.replace(/\n+/g, " ")}${note} */\n  ${tool.name}(params: ${params}): Promise<${result}>;`;
+	});
 
-	return declarations.join("\n");
+	return `/** Every tool result includes the tool's text output. */
+type ToolText = { text: string };
+
+declare const tools: {
+${methods.join("\n\n")}
+
+  /** Non-throwing variant for any tool: returns the result with ok: true, or { ok: false, error } instead of throwing. */
+  try(name: ${tools.map((t) => JSON.stringify(t.name)).join(" | ")}, params: unknown): Promise<({ ok: true } & ToolText & Record<string, unknown>) | { ok: false; error: string }>;
+};`;
 }
 
-function generateHelperStubs(): string {
-	return `
-/** Names of tools directly bridged into Code Mode. */
-declare const availableTools: readonly string[];
-
-/** Split text into lines and drop one trailing empty line if present. */
+const HELPERS_DECLARATION = `/** Split text into lines (drops one trailing empty line). */
 declare function lines(text: string): string[];
-
-/** Remove common indentation from a multiline string. */
+/** Remove common leading indentation (useful for tools.write content). */
 declare function dedent(text: string): string;
-
-/** Throw if a condition is falsy. */
-declare function assert(condition: unknown, message?: string): asserts condition;
-
-/** Split an array into evenly sized chunks. */
-declare function chunk<T>(items: T[], size: number): T[][];
-
-/** Run async work with bounded parallelism while preserving result order. */
+/** Run async work over items with bounded parallelism, preserving order. */
 declare function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]>;
-
-/** Try a bridged tool dynamically and get a success/error envelope instead of throwing. */
-declare function callTool<T = unknown>(name: string, params: unknown): Promise<{ ok: true; value: T } | { ok: false; error: string }>;
-
-/** Call a bridged tool dynamically and throw on failure. */
-declare function mustCallTool<T = unknown>(name: string, params: unknown): Promise<T>;
-
-/** Convenience wrapper around external_read({ path, ...options }). */
-declare function readText(path: string, options?: { offset?: number; limit?: number }): Promise<string>;
-
-declare type ReadTextAsset = {
-  kind: "read";
-  path: string;
-  text: string;
-  startLine?: number;
-  endLine?: number;
-  lineCount?: number;
-  totalLines?: number;
-};
-
-declare type ReadImageAsset = {
-  kind: "image";
-  path: string;
-  text: string;
-  mimeType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
-  bytes: number;
-  base64?: string;
-};
-
-/** Read a file as a structured asset. Images return metadata and may include base64 for smaller files. */
-declare function readAsset(path: string, options?: { offset?: number; limit?: number }): Promise<ReadTextAsset | ReadImageAsset>;
-
-/** Read many files with bounded parallelism and get structured assets back. */
-declare function readMany(paths: string[], options?: { concurrency?: number; offset?: number; limit?: number }): Promise<Array<{
-  path: string;
-  asset: ReadTextAsset | ReadImageAsset;
-}>>;
-
-/** Read a text file and split it into lines. */
-declare function readLines(path: string, options?: { offset?: number; limit?: number }): Promise<string[]>;
-
-/** Read and parse a JSON file. */
+/** tools.read + JSON.parse. */
 declare function readJson<T = unknown>(path: string): Promise<T>;
+/** tools.bash + parse JSON from the output (accepts a command string or bash params). */
+declare function bashJson<T = unknown>(command: string | { command: string; timeout?: number }): Promise<T>;
+/** tools.grep + parse output into { path, line, text } entries (use without the context option). */
+declare function grepEntries(params: Parameters<typeof tools.grep>[0]): Promise<Array<{ path: string; line: number; text: string }>>;`;
 
-/** Read many JSON files with bounded parallelism. */
-declare function readJsonMany<T = unknown>(paths: string[], options?: { concurrency?: number }): Promise<Array<{
-  path: string;
-  value: T;
-}>>;
+// Compile-time check that the docs above cover exactly the sandbox helpers.
+type HelperName = (typeof SANDBOX_HELPER_NAMES)[number];
+const documentedHelpers: readonly HelperName[] = ["lines", "dedent", "mapLimit", "readJson", "bashJson", "grepEntries"];
+void documentedHelpers;
 
-/** Structured result for write operations. */
-declare function writeResult(path: string, content: string): Promise<{
-  kind: "write";
-  text: string;
-  path: string;
-  bytesWritten?: number;
-}>;
-
-/** JSON.stringify(value, null, space) and write it with a trailing newline. */
-declare function writeJson(path: string, value: unknown, space?: number): Promise<string>;
-
-/** Structured result for bash commands, including exit code and separated stdout/stderr. */
-declare function bashResult(params: Parameters<typeof external_bash>[0]): Promise<{
-  kind: "bash";
-  text: string;
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  ok: boolean;
-  killed?: boolean;
-}>;
-
-/** Run bash and split the combined output into lines. */
-declare function bashLines(params: Parameters<typeof external_bash>[0]): Promise<string[]>;
-
-/** Run bash and parse JSON from the output. Accepts either pure JSON or JSON embedded in surrounding text. */
-declare function bashJson<T = unknown>(params: Parameters<typeof external_bash>[0]): Promise<T>;
-
-/** Structured grep result. noMatches is not treated as an error. */
-declare function grepResult(params: Parameters<typeof external_grep>[0]): Promise<{
-  kind: "grep";
-  text: string;
-  stdout: string;
-  stderr: string;
-  lines: string[];
-  exitCode: number;
-  ok: boolean;
-  matched: boolean;
-  noMatches: boolean;
-  error?: string;
-}>;
-
-/** Parse grep output lines into path/line/text entries. Context lines are marked with matched=false. */
-declare function grepEntries(params: Parameters<typeof external_grep>[0]): Promise<Array<{
-  path?: string;
-  line?: number;
-  text?: string;
-  matched: boolean;
-  raw: string;
-}>>;
-
-/** Run grep and return matching lines as an array. */
-declare function grepLines(params: Parameters<typeof external_grep>[0]): Promise<string[]>;
-
-/** Structured find result. noMatches is not treated as an error. */
-declare function findResult(params: Parameters<typeof external_find>[0]): Promise<{
-  kind: "find";
-  text: string;
-  stdout: string;
-  stderr: string;
-  paths: string[];
-  exitCode: number;
-  ok: boolean;
-  matched: boolean;
-  noMatches: boolean;
-  error?: string;
-}>;
-
-/** Run find and return matching paths as an array. */
-declare function findPaths(params: Parameters<typeof external_find>[0]): Promise<string[]>;
-
-/** Structured result for ls. */
-declare function lsResult(params?: Parameters<typeof external_ls>[0]): Promise<{
-  kind: "ls";
-  text: string;
-  entries: string[];
-  path: string;
-}>;
-
-/** Run ls and return entries as an array. */
-declare function lsEntries(params?: Parameters<typeof external_ls>[0]): Promise<string[]>;
-
-/** Preview an edit without modifying the file, including first changed line and a compact diff. */
-declare function previewEdits(path: string, edits: Parameters<typeof external_edit>[0]["edits"]): Promise<{
-  kind: "edit-preview";
-  path: string;
-  edits: Parameters<typeof external_edit>[0]["edits"];
-  editsApplied: number;
-  firstChangedLine?: number;
-  diff: string;
-}>;
-
-/** Apply edits to one file and get structured metadata back. */
-declare function applyFileEdits(path: string, edits: Parameters<typeof external_edit>[0]["edits"]): Promise<{
-  kind: "edit";
-  text: string;
-  path: string;
-  editsApplied: number;
-  firstChangedLine?: number;
-  diff: string;
-  preview: Awaited<ReturnType<typeof previewEdits>>;
-}>;
-
-/** Validate all edits first, then apply them sequentially across multiple files. */
-declare function batchEdits(changes: Array<{
-  path: string;
-  edits: Parameters<typeof external_edit>[0]["edits"];
-}>): Promise<{
-  previews: Array<Awaited<ReturnType<typeof previewEdits>>>;
-  results: Array<Awaited<ReturnType<typeof applyFileEdits>>>;
-}>;
-`;
-}
-
-function generateExamples(): string {
-	return `
-### Helper functions
-
-Code Mode also provides a few built-in helpers so you do less string parsing and boilerplate:
+const EXAMPLES = `Summarize matches across many files (parallel, bounded):
 
 \`\`\`typescript
-${generateHelperStubs().trim()}
+const entries = await grepEntries({ pattern: "TODO", glob: "*.ts" });
+const byFile = [...new Set(entries.map((e) => e.path))];
+const sizes = await mapLimit(byFile, 8, async (path) => {
+  const r = await tools.read({ path });
+  return { path, lines: lines(r.text).length };
+});
+return { todos: entries.length, files: sizes };
 \`\`\`
+
+Run a command, branch on the outcome, then edit:
+
+\`\`\`typescript
+const check = await tools.try("bash", { command: "npm run check", timeout: 120 });
+if (check.ok) return "check passed, no edits needed";
+const fix = await tools.edit({
+  path: "src/config.ts",
+  edits: [{ oldText: "debug: true", newText: "debug: false" }],
+});
+return { error: check.error.slice(0, 400), diff: fix.diff };
+\`\`\``;
+
+export function buildCodeModePrompt(tools: BridgedToolSchema[]): string {
+	return `## Code Mode
+
+You have an \`execute_typescript\` tool. Instead of calling tools one at a time, you can
+write a TypeScript program that composes them with loops, conditionals, \`Promise.all\`,
+and data transformations. Bridged tool calls execute concurrently on the host, so
+\`Promise.all\` / \`mapLimit\` give real parallelism.
+
+### Sandbox API
+
+\`\`\`typescript
+${buildToolsDeclaration(tools)}
+
+${HELPERS_DECLARATION}
+\`\`\`
+
+These are the same tools you normally call directly (same parameters, same truncation
+behavior); failures throw an \`Error\` whose message is the tool's error text.
 
 ### Examples
 
-Read JSON and summarize it:
-
-\`\`\`typescript
-const pkg = await readJson<{ name?: string; scripts?: Record<string, string> }>("package.json");
-return {
-  name: pkg.name,
-  scripts: Object.keys(pkg.scripts ?? {}),
-};
-\`\`\`
-
-Run bounded parallel work across many files:
-
-\`\`\`typescript
-const files = await findPaths({ path: "src", pattern: "**/*.ts", limit: 200 });
-const summaries = await mapLimit(files, 8, async (file) => {
-  const text = await readText(file);
-  return { file, lines: lines(text).length };
-});
-return summaries;
-\`\`\`
-
-Read either text or an image asset:
-
-\`\`\`typescript
-const asset = await readAsset("screenshot.png");
-if (asset.kind === "image") {
-  return {
-    mimeType: asset.mimeType,
-    bytes: asset.bytes,
-    hasBase64: !!asset.base64,
-  };
-}
-return { textPreview: asset.text.slice(0, 200) };
-\`\`\`
-
-Read many files with bounded parallelism:
-
-\`\`\`typescript
-const files = ["package.json", "tsconfig.json"];
-const loaded = await readMany(files, { concurrency: 2 });
-return loaded.map((entry) => ({
-  path: entry.path,
-  kind: entry.asset.kind,
-}));
-\`\`\`
-
-Inspect a bash command without throwing on non-zero exit:
-
-\`\`\`typescript
-const result = await bashResult({ command: "git status --short", timeout: 20 });
-return {
-  ok: result.ok,
-  exitCode: result.exitCode,
-  lines: lines(result.stdout),
-};
-\`\`\`
-
-Handle grep/find without guessing whether an empty result is an error:
-
-\`\`\`typescript
-const grep = await grepResult({
-  pattern: "TODO",
-  path: "src",
-  glob: "*.ts",
-  limit: 20,
-});
-if (!grep.ok) throw new Error(grep.error ?? "grep failed");
-if (grep.noMatches) return [];
-return grep.lines;
-\`\`\`
-
-Parse grep output into structured entries:
-
-\`\`\`typescript
-const entries = await grepEntries({
-  pattern: "TODO",
-  path: "src",
-  glob: "*.ts",
-  limit: 20,
-});
-return entries.filter((entry) => entry.matched);
-\`\`\`
-
-Call a bridged tool dynamically:
-
-\`\`\`typescript
-const grep = await callTool<{ text: string; lines?: string[] }>("grep", {
-  pattern: "TODO",
-  path: "src",
-  glob: "*.ts",
-  limit: 20,
-});
-if (!grep.ok) return grep;
-return grep.value.lines ?? lines(grep.value.text);
-\`\`\`
-
-Preview and apply safe multi-file edits:
-
-\`\`\`typescript
-const plan = [
-  {
-    path: "src/a.ts",
-    edits: [{ oldText: "foo", newText: "bar" }],
-  },
-  {
-    path: "src/b.ts",
-    edits: [{ oldText: "baz", newText: "qux" }],
-  },
-];
-
-const preview = await batchEdits(plan);
-return preview.results.map((result) => ({
-  path: result.path,
-  firstChangedLine: result.firstChangedLine,
-  diff: result.diff,
-}));
-\`\`\`
-`;
-}
-
-/**
- * Build the system prompt snippet explaining Code Mode to the LLM.
- */
-export function buildCodeModeSystemPrompt(tools: ToolSchema[]): string {
-	const stubs = generateTypeStubs(tools);
-	const examples = generateExamples();
-
-	return `## Code Mode
-
-You have access to an \`execute_typescript\` tool. Instead of calling tools one-by-one, you
-can write a short TypeScript program that composes tools with loops, conditionals,
-Promise.all, and data transformations. The code runs in a V8 isolate sandbox.
-
-### Available external functions
-
-Each bridged tool is available as an \`external_*\` async function. They accept the same
-parameter object as the original tool and return the tool's text result as a string.
-
-\`\`\`typescript
-${stubs}
-\`\`\`
-
-${examples}
+${EXAMPLES}
 
 ### Rules
 
-- Your code MUST use \`return\` at the top level to produce a result (the sandbox wraps it in an async function).
-- Use \`external_*\` functions to interact with the filesystem and run commands.
-- Prefer the built-in helpers (like \`readAsset()\`, \`readMany()\`, \`readJson()\`, \`readJsonMany()\`, \`bashResult()\`, \`bashJson()\`, \`grepResult()\`, \`grepEntries()\`, \`findResult()\`, \`findPaths()\`, \`previewEdits()\`, \`batchEdits()\`, and \`mapLimit()\`) when they reduce boilerplate.
-- Use \`callTool()\` / \`mustCallTool()\` when you want dynamic tool selection or structured access to a bridged tool result.
-- \`console.log()\` output is captured and included in the result.
-- TypeScript type annotations are stripped before execution. Write idiomatic TS.
-- The sandbox has a 120-second timeout and no network/filesystem access outside of external_* calls.
-- Prefer \`Promise.all()\` to parallelize independent operations.
-- Prefer computing results (math, aggregation, filtering) in code instead of asking the LLM.
-- Prefer returning structured objects/arrays when useful; Code Mode will pretty-print JSON results.
-
-### When to use Code Mode
-
-- When you need to compose 3+ tool calls
-- When you need to parallelize operations (e.g. reading multiple files)
-- When you need to do math, aggregation, or data transformation on tool results
-- When you need loops or conditionals over tool results
-- When helper functions like \`readAsset()\`, \`readMany()\`, \`readJson()\`, \`readJsonMany()\`, \`bashResult()\`, \`grepResult()\`, \`grepEntries()\`, \`findResult()\`, \`findPaths()\`, \`previewEdits()\`, \`batchEdits()\`, or \`mapLimit()\` simplify the task
-
-### When NOT to use Code Mode
-
-- For a single simple tool call (just call the tool directly)
-- When the user is asking a question that doesn't need tools`;
+- End with a top-level \`return\` — the returned value (JSON-serializable) is the result shown to you.
+- \`console.log/info/warn/error\` output is captured and returned too.
+- Compute in code (counting, math, filtering, aggregation) instead of eyeballing it afterwards.
+- Prefer \`Promise.all\`/\`mapLimit\` for independent operations; they truly run in parallel.
+- Return compact summaries, not entire file contents — the result lands in your context window.
+- The sandbox has no network or filesystem access except through \`tools.*\`; it times out after 120s.
+- Use Code Mode for multi-step work with loops/branching/aggregation. For a single tool call, call the tool directly.`;
 }

@@ -1,7 +1,7 @@
 {
   "name": "@juanrgon/pi-code-mode",
-  "version": "0.1.0",
-  "description": "Code Mode extension for pi — gives the LLM an execute_typescript tool to compose multiple tool calls in a V8 sandbox",
+  "version": "0.2.0",
+  "description": "Code Mode extension for pi — the LLM writes TypeScript that composes pi's core tools with real parallelism, delegating to pi's actual tool implementations",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -21,13 +21,24 @@
       "./index.ts"
     ]
   },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "vitest run"
+  },
   "dependencies": {
-    "esbuild": "^0.28.0",
-    "isolated-vm": "^5.0.1"
+    "esbuild": "^0.28.0"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.79.0",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "^1.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
   }
 }

@@ -1,369 +1,322 @@
 /**
- * Code Mode Extension
+ * Code Mode extension for pi.
  *
- * Gives the LLM an `execute_typescript` tool. Instead of calling tools one at a
- * time, the model writes a short TypeScript program that composes tools with
- * loops, conditionals, Promise.all, and data transforms, then executes it in a
- * V8 isolate sandbox. One call in, one structured result out.
+ * Registers an `execute_typescript` tool: the LLM writes a TypeScript program
+ * that composes pi's core tools (`tools.read`, `tools.bash`, ...) with loops,
+ * conditionals, Promise.all, and data transformations.
  *
- * Inspired by TanStack AI Code Mode:
- *   https://tanstack.com/blog/tanstack-ai-code-mode
+ * v2 architecture:
+ * - worker_threads + node:vm sandbox with an async postMessage bridge, so
+ *   bridged tool calls run truly concurrently (no native deps).
+ * - Bridged tools delegate to pi's real tool implementations
+ *   (create*ToolDefinition), inheriting truncation, the per-file mutation
+ *   queue, and exact semantics.
+ * - Abort/timeout terminate the worker and abort in-flight tools.
+ * - Final output is truncated to pi's standard limits (full output saved to a
+ *   temp file), with a per-call audit trail in details.
  *
- * Toggle: /code-mode  or  Ctrl+Alt+C
+ * Toggle: /code-mode (off | additive | replace) or Ctrl+Alt+C.
+ * In replace mode the bridged built-in tools are hidden from the model and
+ * only reachable through execute_typescript.
  *
- * When enabled the LLM gets the execute_typescript tool *in addition* to the
- * normal tools. The system prompt is augmented with typed stubs so the model
- * knows exactly how to call external_read(), external_bash(), etc.
+ * Inspired by TanStack AI Code Mode; execution architecture informed by
+ * Hor1zonZzz/pi-codeMode.
  */
 
-import { resolve, dirname, extname } from "node:path";
-import { readFile, writeFile, mkdir, readdir } from "node:fs/promises";
-import { Type } from "@sinclair/typebox";
-import { highlightCode, keyHint, type ExtensionAPI, type ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Key, Text } from "@mariozechner/pi-tui";
-import { executeInSandbox, type ExternalFunction } from "./sandbox.js";
-import { buildCodeModeSystemPrompt, type ToolSchema } from "./stubs.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { writeFile } from "node:fs/promises";
+import { Type } from "typebox";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	createBashToolDefinition,
+	createEditToolDefinition,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createLsToolDefinition,
+	createReadToolDefinition,
+	createWriteToolDefinition,
+	formatSize,
+	highlightCode,
+	keyHint,
+	truncateHead,
+	type ExtensionAPI,
+	type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { Key, Text } from "@earendil-works/pi-tui";
+import { runCode, DEFAULT_TIMEOUT_MS, type BridgeImage, type CallSummary, type RunOutcome, type ToolExecutor } from "./runner.js";
+import { buildCodeModePrompt, type BridgedToolSchema } from "./stubs.js";
+
+export const BRIDGED_TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
+export type BridgedToolName = (typeof BRIDGED_TOOL_NAMES)[number];
+const MAX_RESULT_IMAGES = 3;
+
+/** Loosely-typed view of pi's ToolDefinition to stay resilient across versions. */
+interface BridgedDefinition {
+	name: string;
+	description: string;
+	parameters: Record<string, unknown>;
+	prepareArguments?: (args: unknown) => unknown;
+	execute(
+		toolCallId: string,
+		params: unknown,
+		signal: AbortSignal | undefined,
+		onUpdate: undefined,
+		ctx: ExtensionContext,
+	): Promise<{ content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>; details?: unknown }>;
+}
+
+export function createBridgedDefinitions(cwd: string): Record<BridgedToolName, BridgedDefinition> {
+	return {
+		read: createReadToolDefinition(cwd),
+		bash: createBashToolDefinition(cwd),
+		edit: createEditToolDefinition(cwd),
+		write: createWriteToolDefinition(cwd),
+		grep: createGrepToolDefinition(cwd),
+		find: createFindToolDefinition(cwd),
+		ls: createLsToolDefinition(cwd),
+	} as unknown as Record<BridgedToolName, BridgedDefinition>;
+}
+
+/**
+ * Build runner executors that delegate to pi's real tool definitions.
+ * Exported for tests so the test bridge cannot drift from the runtime bridge.
+ */
+export function createBridgedExecutors(
+	defs: Record<BridgedToolName, BridgedDefinition>,
+	ctx: ExtensionContext,
+	idPrefix: string,
+): Record<string, ToolExecutor> {
+	let callSequence = 0;
+	const executors: Record<string, ToolExecutor> = {};
+	for (const name of BRIDGED_TOOL_NAMES) {
+		executors[name] = async (rawParams, toolSignal) => {
+			const def = defs[name];
+			const prepared = def.prepareArguments ? def.prepareArguments(rawParams) : rawParams;
+			const result = await def.execute(`${idPrefix}#${++callSequence}`, prepared, toolSignal, undefined, ctx);
+			const text = (result.content ?? [])
+				.filter((block) => block.type === "text" && typeof block.text === "string")
+				.map((block) => block.text)
+				.join("\n");
+			const images: BridgeImage[] = (result.content ?? [])
+				.filter((block) => block.type === "image" && typeof block.data === "string")
+				.map((block) => ({ data: block.data as string, mimeType: (block.mimeType as string) ?? "image/png" }));
+			return { value: toBridgeValue(name, text, result.details, images.length > 0), images };
+		};
+	}
+	return executors;
+}
+
+/** Shape the bridged tool result into the sandbox-facing value (must match stubs.ts RESULT_EXTRAS). */
+function toBridgeValue(
+	tool: BridgedToolName,
+	text: string,
+	details: unknown,
+	hasImages: boolean,
+): Record<string, unknown> {
+	const d = (details ?? {}) as {
+		truncation?: { truncated?: boolean };
+		fullOutputPath?: string;
+		diff?: string;
+		firstChangedLine?: number;
+		matchLimitReached?: number;
+		resultLimitReached?: number;
+		entryLimitReached?: number;
+	};
+	const truncated = !!d.truncation?.truncated;
+	switch (tool) {
+		case "read":
+			return { text, kind: hasImages ? "image" : "text", truncated };
+		case "bash":
+			return { text, truncated, fullOutputPath: d.fullOutputPath };
+		case "edit":
+			return { text, diff: d.diff ?? "", firstChangedLine: d.firstChangedLine };
+		case "write":
+			return { text };
+		case "grep":
+			return { text, truncated: truncated || d.matchLimitReached !== undefined };
+		case "find":
+			return { text, truncated: truncated || d.resultLimitReached !== undefined };
+		case "ls":
+			return { text, truncated: truncated || d.entryLimitReached !== undefined };
+	}
+}
+
+/**
+ * Format a run outcome into the LLM-facing text, applying pi's standard output
+ * truncation (full output saved to a temp file). Exported for tests.
+ */
+export async function buildResultText(outcome: RunOutcome): Promise<{ text: string; truncated: boolean }> {
+	const parts: string[] = [];
+	if (outcome.console.length > 0) {
+		parts.push("── console ──");
+		parts.push(
+			outcome.console
+				.map((entry) => (entry.level === "log" || entry.level === "info" ? entry.text : `[${entry.level}] ${entry.text}`))
+				.join("\n"),
+		);
+	}
+	if (outcome.ok) {
+		if (outcome.result !== undefined) {
+			parts.push("── result ──");
+			parts.push(typeof outcome.result === "string" ? outcome.result : JSON.stringify(outcome.result, null, 2));
+		} else if (outcome.console.length === 0) {
+			parts.push("(no output — end with a top-level `return`)");
+		}
+	} else {
+		parts.push("── error ──");
+		parts.push(outcome.errorText ?? "Unknown error");
+	}
+
+	const seconds = (outcome.durationMs / 1000).toFixed(1);
+	const callCount = outcome.calls.length;
+	const statusLine = `${outcome.ok ? "✓" : "✗"} ${callCount} tool call${callCount === 1 ? "" : "s"} · ${seconds}s`;
+
+	let text = parts.join("\n");
+	const truncation = truncateHead(text, { maxLines: DEFAULT_MAX_LINES, maxBytes: DEFAULT_MAX_BYTES });
+	if (truncation.truncated) {
+		const fullPath = join(tmpdir(), `pi-code-mode-${Date.now()}.txt`);
+		await writeFile(fullPath, text, "utf-8").catch(() => undefined);
+		text =
+			truncation.content +
+			`\n\n[Output truncated: ${truncation.outputLines} of ${truncation.totalLines} lines` +
+			` (${formatSize(truncation.outputBytes)} of ${formatSize(truncation.totalBytes)}). Full output: ${fullPath}]`;
+	}
+
+	const keptImages = outcome.images.slice(0, MAX_RESULT_IMAGES);
+	if (outcome.images.length > keptImages.length) {
+		text += `\n[${outcome.images.length - keptImages.length} additional image(s) omitted — read them directly with the read tool]`;
+	}
+	text += `\n\n${statusLine}`;
+	return { text, truncated: truncation.truncated };
+}
 
 export default function codeModeExtension(pi: ExtensionAPI): void {
 	let enabled = true;
-	let toolsSnapshot: ToolSchema[] = [];
-	const bridgedToolNames = new Set(["bash", "read", "write", "edit", "grep", "find", "ls"]);
+	let replace = false;
+	const definitionsCache = new Map<string, Record<BridgedToolName, BridgedDefinition>>();
+	const promptCache = new Map<string, string>();
 
-	// ── helpers ──────────────────────────────────────────────────────────
+	function definitionsFor(cwd: string): Record<BridgedToolName, BridgedDefinition> {
+		let defs = definitionsCache.get(cwd);
+		if (!defs) {
+			defs = createBridgedDefinitions(cwd);
+			definitionsCache.set(cwd, defs);
+		}
+		return defs;
+	}
+
+	function promptFor(cwd: string): string {
+		let prompt = promptCache.get(cwd);
+		if (!prompt) {
+			const defs = definitionsFor(cwd);
+			const schemas: BridgedToolSchema[] = BRIDGED_TOOL_NAMES.map((name) => ({
+				name,
+				description: defs[name].description,
+				parameters: defs[name].parameters,
+			}));
+			prompt = buildCodeModePrompt(schemas);
+			promptCache.set(cwd, prompt);
+		}
+		return prompt;
+	}
+
+	// ── state, status, tool visibility ───────────────────────────────────
+
+	function modeLabel(): string {
+		if (!enabled) return "off";
+		return replace ? "on (replace)" : "on";
+	}
 
 	function updateStatus(ctx: ExtensionContext): void {
 		const theme = ctx.ui.theme;
-		if (enabled) {
-			ctx.ui.setStatus(
-				"code-mode",
-				theme.fg("accent", "⚡ code mode on") + theme.fg("dim", " — /code-mode or Ctrl+Alt+C to turn it off"),
-			);
+		const hint = theme.fg("dim", " — /code-mode or Ctrl+Alt+C");
+		ctx.ui.setStatus(
+			"code-mode",
+			enabled ? theme.fg("accent", `⚡ code mode ${modeLabel()}`) + hint : theme.fg("dim", "⚡ code mode off") + hint,
+		);
+	}
+
+	/** In replace mode, hide the bridged built-ins; otherwise make sure they are active. */
+	function applyToolVisibility(): void {
+		const bridged = new Set<string>(BRIDGED_TOOL_NAMES);
+		const allNames = new Set(pi.getAllTools().map((t) => t.name));
+		const active = pi.getActiveTools();
+		if (enabled && replace) {
+			pi.setActiveTools(active.filter((name) => !bridged.has(name)));
 		} else {
-			ctx.ui.setStatus(
-				"code-mode",
-				theme.fg("dim", "⚡ code mode off — /code-mode or Ctrl+Alt+C to turn it on"),
-			);
+			const next = new Set(active);
+			for (const name of BRIDGED_TOOL_NAMES) {
+				if (allNames.has(name)) next.add(name);
+			}
+			if (next.size !== active.length) pi.setActiveTools([...next]);
 		}
 	}
 
-	function snapshotTools(): ToolSchema[] {
-		return pi
-			.getAllTools()
-			.filter((t) => t.name !== "execute_typescript" && bridgedToolNames.has(t.name))
-			.map((t) => ({
-				name: t.name,
-				description: t.description ?? "",
-				parameters: (t.parameters ?? {}) as Record<string, unknown>,
-			}));
-	}
-
-	function toggle(ctx: ExtensionContext): void {
-		enabled = !enabled;
-
-		if (enabled) {
-			toolsSnapshot = snapshotTools();
-			ctx.ui.notify("Code Mode enabled — LLM can now use execute_typescript", "info");
-		} else {
-			ctx.ui.notify("Code Mode disabled", "info");
-		}
+	function setMode(ctx: ExtensionContext, nextEnabled: boolean, nextReplace: boolean): void {
+		enabled = nextEnabled;
+		replace = nextReplace;
+		applyToolVisibility();
 		updateStatus(ctx);
-		pi.appendEntry("code-mode-state", { enabled });
+		pi.appendEntry("code-mode-state", { enabled, replace });
+		ctx.ui.notify(`Code Mode: ${modeLabel()}`, "info");
 	}
-
-	function toExecTimeoutMs(seconds: number | undefined, fallbackSeconds: number): number {
-		const effectiveSeconds = seconds ?? fallbackSeconds;
-		return Math.max(1, Math.ceil(effectiveSeconds * 1000));
-	}
-
-	function countLinesBefore(text: string, index: number): number {
-		let count = 1;
-		for (let i = 0; i < index; i++) {
-			if (text[i] === "\n") count++;
-		}
-		return count;
-	}
-
-	function truncatePreview(text: string, maxLines = 12, maxChars = 1200): string {
-		const normalized = text.replace(/\r/g, "");
-		const lines = normalized.split("\n");
-		const sliced = lines.slice(0, maxLines).join("\n");
-		const truncatedByLines = lines.length > maxLines;
-		const truncatedByChars = sliced.length > maxChars;
-		const body = truncatedByChars ? sliced.slice(0, maxChars) : sliced;
-		return body + (truncatedByLines || truncatedByChars ? "\n…" : "");
-	}
-
-	function getImageMimeType(path: string): string | undefined {
-		switch (extname(path).toLowerCase()) {
-			case ".png":
-				return "image/png";
-			case ".jpg":
-			case ".jpeg":
-				return "image/jpeg";
-			case ".gif":
-				return "image/gif";
-			case ".webp":
-				return "image/webp";
-			default:
-				return undefined;
-		}
-	}
-
-	// ── build external_* bridge for a given tool ────────────────────────
-
-	function buildExternalBridge(tool: ToolSchema, cwd: string, signal?: AbortSignal): ExternalFunction {
-		return {
-			name: tool.name,
-			handler: async (paramsJson: string) => {
-				const params = JSON.parse(paramsJson);
-
-				if (tool.name === "bash") {
-					const result = await pi.exec("bash", ["-c", params.command], {
-						signal,
-						timeout: toExecTimeoutMs(params.timeout, 30),
-					});
-					const stdout = result.stdout ?? "";
-					const stderr = result.stderr ?? "";
-					return {
-						kind: "bash",
-						text: stdout + stderr,
-						stdout,
-						stderr,
-						exitCode: result.code ?? 0,
-						ok: (result.code ?? 0) === 0,
-						killed: !!result.killed,
-					};
-				}
-
-				if (tool.name === "read") {
-					const filePath = resolve(cwd, params.path);
-					const mimeType = getImageMimeType(filePath);
-
-					if (mimeType) {
-						const buffer = await readFile(filePath);
-						const includeBase64 = buffer.byteLength <= 512 * 1024;
-						return {
-							kind: "image",
-							text: includeBase64
-								? `Read image file [${mimeType}]`
-								: `Read image file [${mimeType}]\n[Base64 omitted: image exceeds 512KB helper limit.]`,
-							path: params.path,
-							mimeType,
-							bytes: buffer.byteLength,
-							base64: includeBase64 ? buffer.toString("base64") : undefined,
-						};
-					}
-
-					const content = (await readFile(filePath)).toString("utf-8");
-					const allLines = content.split("\n");
-					const startIndex = Math.max(0, (params.offset ?? 1) - 1);
-					if (startIndex >= allLines.length) {
-						throw new Error(`Offset ${params.offset} is beyond end of file (${allLines.length} lines total)`);
-					}
-					const endIndex = params.limit !== undefined ? Math.min(startIndex + params.limit, allLines.length) : allLines.length;
-					const selectedLines = allLines.slice(startIndex, endIndex);
-					const text = selectedLines.join("\n");
-					return {
-						kind: "read",
-						text,
-						path: params.path,
-						startLine: startIndex + 1,
-						endLine: endIndex,
-						lineCount: selectedLines.length,
-						totalLines: allLines.length,
-					};
-				}
-
-				if (tool.name === "write") {
-					const filePath = resolve(cwd, params.path);
-					await mkdir(dirname(filePath), { recursive: true });
-					await writeFile(filePath, params.content, "utf-8");
-					return {
-						kind: "write",
-						text: `Wrote ${params.content.length} bytes to ${params.path}`,
-						path: params.path,
-						bytesWritten: params.content.length,
-					};
-				}
-
-				if (tool.name === "edit") {
-					const filePath = resolve(cwd, params.path);
-					const originalContent = await readFile(filePath, "utf-8");
-					const edits = params.edits ?? [{ oldText: params.oldText, newText: params.newText }];
-
-					const matches = edits
-						.map((edit: { oldText: string; newText: string }, index: number) => {
-							const start = originalContent.indexOf(edit.oldText);
-							if (start === -1) {
-								throw new Error(`oldText not found in ${params.path}: "${edit.oldText.slice(0, 80)}..."`);
-							}
-							const next = originalContent.indexOf(edit.oldText, start + 1);
-							if (next !== -1) {
-								throw new Error(`oldText matched more than once in ${params.path}: "${edit.oldText.slice(0, 80)}..."`);
-							}
-							return {
-								index,
-								start,
-								end: start + edit.oldText.length,
-								oldText: edit.oldText,
-								newText: edit.newText,
-								line: countLinesBefore(originalContent, start),
-							};
-						})
-						.sort((a, b) => a.start - b.start);
-
-					for (let i = 1; i < matches.length; i++) {
-						if (matches[i].start < matches[i - 1].end) {
-							throw new Error(`edit ${matches[i].index + 1} overlaps another edit in ${params.path}`);
-						}
-					}
-
-					let content = originalContent;
-					for (const match of [...matches].sort((a, b) => b.start - a.start)) {
-						content = content.slice(0, match.start) + match.newText + content.slice(match.end);
-					}
-
-					await writeFile(filePath, content, "utf-8");
-					const diff = matches
-						.map((match) => {
-							const oldPreview = truncatePreview(match.oldText)
-								.split("\n")
-								.map((line) => `- ${line}`);
-							const newPreview = truncatePreview(match.newText)
-								.split("\n")
-								.map((line) => `+ ${line}`);
-							return [`@@ line ${match.line} @@`, ...oldPreview, ...newPreview].join("\n");
-						})
-						.join("\n\n");
-					return {
-						kind: "edit",
-						text: `Applied ${edits.length} edit(s) to ${params.path}`,
-						path: params.path,
-						editsApplied: edits.length,
-						firstChangedLine: matches[0]?.line,
-						diff,
-					};
-				}
-
-				if (tool.name === "grep") {
-					const args: string[] = ["-n"];
-					if (params.ignoreCase) args.push("-i");
-					if (params.literal) args.push("-F");
-					if (params.context !== undefined) args.push("-C", String(params.context));
-					if (params.glob) args.push("--glob", params.glob);
-					if (params.limit !== undefined) args.push("--max-count", String(params.limit));
-					args.push(params.pattern);
-					args.push(params.path ? resolve(cwd, params.path) : cwd);
-					const result = await pi.exec("rg", args, {
-						signal,
-						timeout: toExecTimeoutMs(undefined, 30),
-					});
-					const stdout = result.stdout ?? "";
-					const stderr = result.stderr ?? "";
-					const exitCode = result.code ?? 0;
-					const noMatches = exitCode === 1 && stderr.trim() === "";
-					const ok = exitCode === 0 || noMatches;
-					const text = stdout + stderr;
-					return {
-						kind: "grep",
-						text,
-						stdout,
-						stderr,
-						lines: stdout.split("\n").filter(Boolean),
-						exitCode,
-						ok,
-						matched: stdout.trim().length > 0,
-						noMatches,
-						error: ok ? undefined : stderr.trim() || `rg exited with code ${exitCode}`,
-					};
-				}
-
-				if (tool.name === "find") {
-					const target = resolve(cwd, params.path ?? ".");
-					const args: string[] = ["--files"];
-					if (params.pattern) args.push("-g", params.pattern);
-					const result = await pi.exec("rg", args, {
-						cwd: target,
-						signal,
-						timeout: toExecTimeoutMs(undefined, 30),
-					});
-					const stdout = result.stdout ?? "";
-					const stderr = result.stderr ?? "";
-					const exitCode = result.code ?? 0;
-					const paths = stdout.split("\n").filter(Boolean).slice(0, params.limit ?? 1000);
-					const ok = exitCode === 0 || (exitCode === 1 && stderr.trim() === "" && paths.length === 0);
-					return {
-						kind: "find",
-						text: stdout + stderr,
-						stdout,
-						stderr,
-						paths,
-						exitCode,
-						ok,
-						matched: paths.length > 0,
-						noMatches: paths.length === 0 && ok,
-						error: ok ? undefined : stderr.trim() || `find failed with code ${exitCode}`,
-					};
-				}
-
-				if (tool.name === "ls") {
-					const target = resolve(cwd, params.path ?? ".");
-					const entries = (await readdir(target, { withFileTypes: true }))
-						.sort((a, b) => a.name.localeCompare(b.name))
-						.slice(0, params.limit ?? 500)
-						.map((entry) => entry.name + (entry.isDirectory() ? "/" : ""));
-					return {
-						kind: "ls",
-						text: entries.join("\n"),
-						entries,
-						path: params.path ?? ".",
-					};
-				}
-
-				throw new Error(
-					`Tool "${tool.name}" is not directly bridged in Code Mode. ` +
-						`Use external_bash() to run it via the command line.`,
-				);
-			},
-		};
-	}
-
-	// ── command + shortcut ──────────────────────────────────────────────
 
 	pi.registerCommand("code-mode", {
-		description: "Toggle Code Mode (execute_typescript tool)",
-		handler: async (_args, ctx) => toggle(ctx),
+		description: "Toggle Code Mode (off | additive | replace built-in tools)",
+		getArgumentCompletions: (prefix) => {
+			const options = ["on", "off", "replace"].filter((o) => o.startsWith(prefix));
+			return options.length > 0 ? options.map((o) => ({ value: o, label: o })) : null;
+		},
+		handler: async (args, ctx) => {
+			const arg = (args ?? "").trim().toLowerCase();
+			if (arg === "on" || arg === "additive") return setMode(ctx, true, false);
+			if (arg === "replace") return setMode(ctx, true, true);
+			if (arg === "off") return setMode(ctx, false, replace);
+			if (ctx.hasUI) {
+				const choice = await ctx.ui.select("Code Mode", [
+					"on — execute_typescript alongside the normal tools",
+					"replace — hide bridged built-in tools, force Code Mode",
+					"off",
+				]);
+				if (choice?.startsWith("on")) return setMode(ctx, true, false);
+				if (choice?.startsWith("replace")) return setMode(ctx, true, true);
+				if (choice === "off") return setMode(ctx, false, replace);
+				return;
+			}
+			setMode(ctx, !enabled, replace);
+		},
 	});
 
 	pi.registerShortcut(Key.ctrlAlt("c"), {
 		description: "Toggle Code Mode",
-		handler: async (ctx) => toggle(ctx),
+		handler: async (ctx) => setMode(ctx, !enabled, replace),
 	});
 
-	// ── the execute_typescript tool ─────────────────────────────────────
+	// ── the execute_typescript tool ──────────────────────────────────────
 
 	pi.registerTool({
 		name: "execute_typescript",
 		label: "Execute TypeScript",
 		description:
-			"Execute a TypeScript program in a V8 sandbox. The code can call " +
-			"external_<toolname>(params) to invoke any active pi tool. Use this " +
-			"to compose multiple tool calls, parallelize with Promise.all, do " +
-			"math/aggregation in JS, and reduce round-trips. Top-level `return` " +
-			"produces the result. console.log() output is captured.",
+			"Execute a TypeScript program in a sandbox. The code calls the bridged pi tools via " +
+			"tools.read(), tools.bash(), tools.edit(), etc. (same parameters and behavior as the " +
+			"normal tools), composes them with loops/conditionals, runs independent calls in " +
+			"parallel via Promise.all, and does math/aggregation in code. End with a top-level " +
+			"`return`; console.log output is captured.",
 		promptSnippet:
-			"Write and execute TypeScript programs that compose tools via external_* calls in a V8 sandbox",
+			"Run TypeScript that composes the core tools (tools.read, tools.bash, ...) with loops, parallelism, and aggregation",
 		promptGuidelines: [
-			"Use execute_typescript when composing 3+ tool calls, parallelizing reads, or doing math/aggregation.",
-			"Inside execute_typescript, call tools via external_read(), external_bash(), external_edit(), etc.",
-			"Use Promise.all() to parallelize independent external_* calls.",
-			"Use top-level `return` to produce the final result.",
+			"Use execute_typescript for multi-step work that needs loops, branching on tool results, or aggregation across many files.",
+			"Inside execute_typescript, independent tools.* calls run concurrently — use Promise.all or mapLimit.",
+			"Do not use execute_typescript for a single tool call; call the tool directly.",
 		],
 		parameters: Type.Object({
 			code: Type.String({
 				description:
-					"TypeScript code to execute. Use external_<tool>(params) to call tools. " +
-					"Top-level `return` produces the result. console.log() is captured.",
+					"TypeScript code. Call bridged tools via tools.<name>(params). End with a top-level `return` " +
+					"producing a JSON-serializable result. console.log output is captured.",
 			}),
 		}),
 
@@ -374,7 +327,6 @@ export default function codeModeExtension(pi: ExtensionAPI): void {
 				text.setText(theme.fg("dim", "⚡ TypeScript — receiving code…"));
 				return text;
 			}
-
 			const highlighted = highlightCode(code, "typescript");
 			const maxLines = context.expanded ? highlighted.length : 14;
 			let body = highlighted.slice(0, maxLines).join("\n");
@@ -384,98 +336,122 @@ export default function codeModeExtension(pi: ExtensionAPI): void {
 					theme.fg("muted", `… ${highlighted.length - maxLines} more lines, `) +
 					keyHint("app.tools.expand", "to expand");
 			}
-
 			text.setText(theme.fg("toolTitle", theme.bold("⚡ TypeScript")) + "\n" + body);
 			return text;
 		},
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		renderResult(result, options, theme, context) {
+			const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+			const body = result.content?.find((block) => block.type === "text")?.text ?? "";
+			const details = result.details as { calls?: CallSummary[] } | undefined;
+
+			if (options.isPartial) {
+				text.setText(theme.fg("dim", body || "running…"));
+				return text;
+			}
+
+			const bodyLines = body.split("\n");
+			const maxLines = options.expanded ? bodyLines.length : 10;
+			let out = bodyLines.slice(0, maxLines).join("\n");
+			if (bodyLines.length > maxLines) {
+				out += "\n" + theme.fg("muted", `… ${bodyLines.length - maxLines} more lines, `) + keyHint("app.tools.expand", "to expand");
+			}
+			if (options.expanded && details?.calls?.length) {
+				out += "\n\n" + theme.fg("muted", theme.bold("tool calls"));
+				for (const call of details.calls) {
+					const status = call.ok === false ? theme.fg("error", "✗") : theme.fg("success", "✓");
+					const duration = call.durationMs !== undefined ? theme.fg("dim", ` ${call.durationMs}ms`) : "";
+					out += `\n${status} ${theme.fg("accent", call.tool)}${duration} ${theme.fg("dim", call.params)}`;
+					if (call.error) out += `\n  ${theme.fg("error", call.error.split("\n")[0].slice(0, 120))}`;
+				}
+			}
+			text.setText(out);
+			return text;
+		},
+
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			if (!enabled) {
 				return {
-					content: [
-						{
-							type: "text",
-							text: "Code Mode is disabled. Use /code-mode to enable it, then try again.",
-						},
-					],
+					content: [{ type: "text", text: "Code Mode is disabled. Use /code-mode to enable it, then try again." }],
 					details: { enabled: false },
 				};
 			}
 
-			toolsSnapshot = snapshotTools();
-			const externals = toolsSnapshot.map((t) => buildExternalBridge(t, ctx.cwd, signal));
+			const defs = definitionsFor(ctx.cwd);
+			const executors = createBridgedExecutors(defs, ctx, toolCallId);
 
-			onUpdate?.({
-				content: [{ type: "text", text: "Executing TypeScript in V8 sandbox..." }],
+			onUpdate?.({ content: [{ type: "text", text: "⚡ running…" }], details: undefined });
+
+			const outcome = await runCode({
+				code: params.code,
+				tools: executors,
+				signal,
+				timeoutMs: DEFAULT_TIMEOUT_MS,
+				onProgress: ({ callsStarted, callsFinished, lastTool }) => {
+					onUpdate?.({
+						content: [
+							{
+								type: "text",
+								text: `⚡ running… ${callsStarted} tool call${callsStarted === 1 ? "" : "s"} (${callsFinished} done${lastTool ? `, last: ${lastTool}` : ""})`,
+							},
+						],
+						details: undefined,
+					});
+				},
 			});
 
-			const result = await executeInSandbox(params.code, externals, signal);
+			// ── format the final output ──────────────────────────────────
+			const { text, truncated } = await buildResultText(outcome);
+			const images = outcome.images.slice(0, MAX_RESULT_IMAGES);
 
-			// Format output
-			const parts: string[] = [];
+			const details = {
+				ok: outcome.ok,
+				durationMs: outcome.durationMs,
+				timedOut: outcome.timedOut,
+				aborted: outcome.aborted,
+				truncated,
+				consoleLines: outcome.console.length,
+				calls: outcome.calls,
+			};
 
-			if (result.consoleOutput.length > 0) {
-				parts.push("── console output ──");
-				parts.push(result.consoleOutput.join("\n"));
-			}
-
-			if (result.success) {
-				if (result.result !== undefined) {
-					parts.push("── result ──");
-					parts.push(result.result);
-				} else if (result.consoleOutput.length === 0) {
-					parts.push("(no output)");
-				}
-				parts.push(`\n✓ Completed in ${result.duration}ms`);
-			} else {
-				parts.push("── error ──");
-				parts.push(result.error ?? "Unknown error");
-				parts.push(`\n✗ Failed after ${result.duration}ms`);
-			}
-
-			const text = parts.join("\n");
-
-			if (!result.success) {
+			if (!outcome.ok) {
 				throw new Error(text);
 			}
 
 			return {
-				content: [{ type: "text", text }],
-				details: {
-					success: result.success,
-					duration: result.duration,
-					consoleLines: result.consoleOutput.length,
-				},
+				content: [
+					{ type: "text", text },
+					...images.map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
+				],
+				details,
 			};
 		},
 	});
 
-	// ── inject Code Mode context into the system prompt ─────────────────
+	// ── system prompt injection ──────────────────────────────────────────
 
-	pi.on("before_agent_start", async () => {
+	pi.on("before_agent_start", async (_event, ctx) => {
 		if (!enabled) return;
-		toolsSnapshot = snapshotTools();
 		return {
 			message: {
 				customType: "code-mode-context",
-				content: buildCodeModeSystemPrompt(toolsSnapshot),
+				content: promptFor(ctx.cwd),
 				display: false,
 			},
 		};
 	});
 
-	// ── restore state on session start ──────────────────────────────────
+	// ── session lifecycle ────────────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
 		for (const entry of ctx.sessionManager.getEntries()) {
-			const e = entry as { type: string; customType?: string; data?: { enabled: boolean } };
+			const e = entry as { type: string; customType?: string; data?: { enabled?: boolean; replace?: boolean } };
 			if (e.type === "custom" && e.customType === "code-mode-state") {
-				enabled = e.data?.enabled ?? false;
+				enabled = e.data?.enabled ?? true;
+				replace = e.data?.replace ?? false;
 			}
 		}
-		if (enabled) {
-			toolsSnapshot = snapshotTools();
-		}
+		applyToolVisibility();
 		updateStatus(ctx);
 	});
 }
